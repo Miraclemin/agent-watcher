@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import SwiftUI
 import UIKit
 
 /// Coordinates communication between the bridge server, SSE event stream,
@@ -26,12 +27,15 @@ final class RelayService: ObservableObject {
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var lastConnected: Date?
     @Published private(set) var isThinking: Bool = false
+    @Published private(set) var pairingNotice: String?
 
     // Multi-session
     @Published private(set) var sessions: [AgentSession] = []
+    @Published private(set) var focusedSessionId: String?
 
     // Permission prompt state (uses shared ApprovalRequest model)
     @Published var pendingApproval: ApprovalRequest? = nil
+    @Published private(set) var pendingApprovalSessionId: String?
 
     // MARK: - Private
 
@@ -46,7 +50,9 @@ final class RelayService: ObservableObject {
     private var pendingTerminalLines: [TerminalLine] = []
 
     private var elapsedTimer: Timer?
+    private var heartbeatTimer: Timer?
     private var sessionStartDate: Date?
+    private var isAppActive = true
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -91,6 +97,7 @@ final class RelayService: ObservableObject {
         }
 
         // Success
+        pairingNotice = nil
         machineName = service.machineName
         lastConnected = Date()
         isPaired = true
@@ -111,6 +118,25 @@ final class RelayService: ObservableObject {
         updateWatchState()
     }
 
+    /// Pairs using a full URL (for Cloudflare Tunnel: https://watch.example.com).
+    func pairWithURL(_ urlString: String, code: String) async throws {
+        print("[RelayService] Cloudflare URL pair: \(urlString)")
+        bridgeClient.configureURL(urlString)
+        try await bridgeClient.pair(code: code)
+
+        pairingNotice = nil
+        lastConnected = Date()
+        isPaired = true
+        connectionState = .connected
+
+        UserDefaults.standard.set(urlString, forKey: "bridge_url")
+        UserDefaults.standard.removeObject(forKey: "bridge_host")
+
+        startEventStream()
+        startElapsedTimer()
+        updateWatchState()
+    }
+
     /// Pairs using a manual IP address (fallback when Bonjour fails on real devices).
     func pairWithIP(_ ip: String, code: String) async throws {
         print("[RelayService] Manual IP pair: \(ip), code: \(code)")
@@ -120,6 +146,7 @@ final class RelayService: ObservableObject {
 
         try await bridgeClient.pair(code: code)
 
+        pairingNotice = nil
         machineName = service.machineName
         lastConnected = Date()
         isPaired = true
@@ -140,6 +167,7 @@ final class RelayService: ObservableObject {
         sseClient.disconnect()
         bridgeClient.clearCredentials()
         stopElapsedTimer()
+        stopHeartbeatTimer()
         terminalBatchTimer?.invalidate()
         terminalBatchTimer = nil
 
@@ -159,6 +187,10 @@ final class RelayService: ObservableObject {
         sessionManager.updateApplicationContext(with: state)
     }
 
+    func clearPairingNotice() {
+        pairingNotice = nil
+    }
+
     // MARK: - Reconnection
 
     private func reconnect() async {
@@ -172,6 +204,7 @@ final class RelayService: ObservableObject {
         connectionState = .connecting
         startEventStream()
         startElapsedTimer()
+        restartHeartbeatTimerIfNeeded()
     }
 
     // MARK: - SSE
@@ -179,12 +212,19 @@ final class RelayService: ObservableObject {
     private func startEventStream() {
         guard let baseURL = bridgeClient.baseURL, let token = bridgeClient.token else { return }
         sseClient.connect(baseURL: baseURL, token: token)
+        restartHeartbeatTimerIfNeeded()
     }
 
     private func setupSSEEventHandler() {
         sseClient.onEvent = { [weak self] event in
             Task { @MainActor in
                 self?.handleBridgeEvent(event)
+            }
+        }
+
+        sseClient.onAuthRejected = { [weak self] in
+            Task { @MainActor in
+                self?.handleBridgeAuthRejected()
             }
         }
 
@@ -195,11 +235,13 @@ final class RelayService: ObservableObject {
                     self?.connectionState = .connected
                     self?.lastConnected = Date()
                     UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
+                    self?.restartHeartbeatTimerIfNeeded()
                     self?.updateWatchState()
                 case .connecting:
                     self?.connectionState = .connecting
                 case .disconnected:
                     self?.connectionState = .disconnected
+                    self?.stopHeartbeatTimer()
                     self?.updateWatchState()
                 case .polling:
                     // Still considered connected, just degraded
@@ -214,14 +256,26 @@ final class RelayService: ObservableObject {
         let data = event.data
 
         switch eventType {
+        case "session-heartbeat":
+            handleSessionHeartbeat(data)
+
         case "pty-output":
             handlePtyOutput(data)
 
         case "permission-request":
             handlePermissionRequest(data)
 
+        case "permission-cleared":
+            handlePermissionCleared(data)
+
         case "session":
             handleSessionEvent(data)
+
+        case "session-removed":
+            handleSessionRemoved(data)
+
+        case "conversation-message":
+            handleConversationMessage(data)
 
         case "tool-output":
             handleToolOutput(data)
@@ -236,11 +290,51 @@ final class RelayService: ObservableObject {
             handleStop(data)
 
         case "poll-status":
-            // Polling fallback -- just keep alive
-            break
+            handlePollStatus(data)
 
         default:
             break
+        }
+    }
+
+    func updateScenePhase(_ phase: ScenePhase) {
+        isAppActive = phase == .active
+        if isAppActive {
+            restartHeartbeatTimerIfNeeded()
+        } else {
+            stopHeartbeatTimer()
+        }
+    }
+
+    private func restartHeartbeatTimerIfNeeded() {
+        stopHeartbeatTimer()
+        guard isPaired, isAppActive else { return }
+
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.sendSessionHeartbeat()
+        }
+        heartbeatTimer?.tolerance = 2
+        sendSessionHeartbeat()
+    }
+
+    private func stopHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+
+    private func sendSessionHeartbeat() {
+        guard connectionState != .disconnected else { return }
+        let runningSessionId = focusedSessionId ?? sessions.first(where: { $0.activity == .running })?.id
+
+        Task {
+            do {
+                try await bridgeClient.sendHeartbeat(sessionId: runningSessionId)
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch {
+                // Keep SSE/polling as the source of truth for connectivity.
+            }
         }
     }
 
@@ -250,20 +344,20 @@ final class RelayService: ObservableObject {
         guard let json = parseJSON(data),
               let text = json["text"] as? String else { return }
         let sessionId = json["sessionId"] as? String
+        let isBootstrap = json["bootstrap"] as? Bool ?? false
 
-        // Strip ANSI escape codes for display
-        let cleaned = text.replacingOccurrences(
-            of: "\\x1B\\[[0-9;]*[a-zA-Z]",
-            with: "",
-            options: .regularExpression
-        )
+        let cleaned = sanitizeTerminalText(text)
+        guard shouldDisplayPtyOutput(cleaned, sessionId: sessionId, isBootstrap: isBootstrap) else { return }
 
         guard !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         let line = TerminalLine(text: cleaned, type: .output, sessionId: sessionId)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
-        appendToSession(line, sessionId: sessionId)
+        appendToSessionIfNotDuplicate(line, sessionId: sessionId)
+        if !isBootstrap {
+            markSessionVisualActivity(sessionId)
+        }
 
         // Batch terminal updates to the watch (1-second window)
         pendingTerminalLines.append(line)
@@ -321,33 +415,56 @@ final class RelayService: ObservableObject {
 
         print("[RelayService] Permission requested: \(toolName) — \(desc)")
 
+        // Determine the target session and whether it is writable.
+        // Only attach the approval to a session if the server explicitly said which session it belongs to.
+        // Never fall back to an unrelated session — that would show the approval in the wrong place.
+        let targetSessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let targetSession = targetSessionId.flatMap { sid in
+            indexForSession(id: sid, externalSessionId: sid).flatMap { idx in
+                sessions.indices.contains(idx) ? sessions[idx] : nil
+            }
+        }
+        let sessionIsWritable = targetSession?.writable ?? true
+        let requiresMacTerminalResponse = {
+            guard let targetSession else { return false }
+            return targetSession.agent == .codex && !targetSession.writable
+        }()
+
+        // Only read-only external Codex mirrors need Mac-terminal-only dismissal.
+        // Claude approvals still work remotely through the bridge hook even when the
+        // mirrored desktop session itself is not writable.
+        let finalOptions: [ApprovalRequest.OptionItem]
+        if requiresMacTerminalResponse && !options.isEmpty {
+            finalOptions = [ApprovalRequest.OptionItem(label: "Dismiss", description: "Respond in your Mac terminal")]
+        } else {
+            finalOptions = options
+        }
+
         let approval = ApprovalRequest(
             permissionId: permissionId,
             toolName: toolName,
             actionSummary: desc,
             question: question,
-            options: options
+            options: finalOptions,
+            readOnly: requiresMacTerminalResponse
         )
 
         pendingApproval = approval
-
-        // Track on specific session
-        if let sid = sessionId, let idx = sessions.firstIndex(where: { $0.id == sid }) {
-            sessions[idx].pendingApproval = approval
-            sessions[idx].activity = .waitingApproval
-        }
+        pendingApprovalSessionId = targetSessionId
+        claimPendingApprovalIfNeeded(preferredSessionId: targetSessionId)
 
         // Haptic feedback
         UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
 
         // Add to terminal
-        let line = TerminalLine(text: "⚠ Permission: \(desc)", type: .system, sessionId: sessionId)
+        let termMsg = sessionIsWritable ? "⚠ Permission: \(desc)" : "⚠ Codex waiting (read-only): \(desc)"
+        let line = TerminalLine(text: termMsg, type: .system, sessionId: sessionId)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
         appendToSession(line, sessionId: sessionId)
 
         // Forward to watch
-        let watchRequest = ApprovalRequest(toolName: toolName, actionSummary: desc, question: question, options: options)
+        let watchRequest = ApprovalRequest(toolName: toolName, actionSummary: desc, question: question, options: finalOptions, readOnly: !sessionIsWritable)
         let message = WatchMessage.approvalRequestMessage(watchRequest)
         sessionManager.send(message)
 
@@ -358,8 +475,12 @@ final class RelayService: ObservableObject {
     // MARK: - Permission response
 
     /// Respond to approval with a selected option (dynamic options from server).
-    func respondToApprovalWithOption(_ optionLabel: String, index: Int) {
-        guard let approval = pendingApproval else { return }
+    func respondToApprovalWithOption(
+        _ optionLabel: String,
+        index: Int,
+        approval explicitApproval: ApprovalRequest? = nil
+    ) {
+        guard let approval = explicitApproval ?? pendingApproval else { return }
         let permissionId = approval.permissionId ?? ""
 
         let isLast = index == approval.options.count - 1
@@ -394,30 +515,188 @@ final class RelayService: ObservableObject {
     /// Sends a text command to the bridge (iOS equivalent of watchOS voice input).
     func sendCommand(text: String, sessionId: String? = nil) {
         let sid = sessionId ?? sessions.first(where: { $0.activity == .running })?.id
+        focusedSessionId = sid
+        if let sid {
+            setActivity(.running, for: sid)
+            markSessionVisualActivity(sid)
+        }
 
-        // Show in terminal
-        let cmdLine = TerminalLine(text: "> \(text)", type: .command, sessionId: sid)
-        terminalBuffer.append(cmdLine)
-        appendToSession(cmdLine, sessionId: sid)
-        recentTerminalLines = terminalBuffer.getLast(15)
+        let shouldEchoLocally = {
+            guard let sid, let session = session(for: sid) else { return true }
+            return !session.sharedTerminal
+        }()
+
+        if shouldEchoLocally {
+            let cmdLine = TerminalLine(text: "> \(text)", type: .command, sessionId: sid)
+            terminalBuffer.append(cmdLine)
+            _ = appendToSessionIfNotDuplicate(cmdLine, sessionId: sid)
+            recentTerminalLines = terminalBuffer.getLast(15)
+        }
 
         isThinking = true
 
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
         Task {
-            try? await bridgeClient.sendCommand(text: text + "\n", sessionId: sid)
+            do {
+                try await bridgeClient.sendCommand(text: text + "\n", sessionId: sid)
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch let BridgeClient.BridgeError.serverError(message) {
+                await MainActor.run {
+                    let line = TerminalLine(text: message, type: .error, sessionId: sid)
+                    self.terminalBuffer.append(line)
+                    self.appendToSession(line, sessionId: sid)
+                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                    self.isThinking = false
+                }
+            } catch {
+                await MainActor.run {
+                    let line = TerminalLine(text: error.localizedDescription, type: .error, sessionId: sid)
+                    self.terminalBuffer.append(line)
+                    self.appendToSession(line, sessionId: sid)
+                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                    self.isThinking = false
+                }
+            }
         }
+    }
+
+    func queueCommand(text: String, sessionId: String) {
+        focusedSessionId = sessionId
+
+        let line = TerminalLine(text: "Queued: \(text)", type: .system, sessionId: sessionId)
+        terminalBuffer.append(line)
+        recentTerminalLines = terminalBuffer.getLast(15)
+        appendToSession(line, sessionId: sessionId)
+
+        Task {
+            do {
+                try await bridgeClient.queueCommand(text: text, sessionId: sessionId)
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    func interruptAndReplace(text: String, sessionId: String) {
+        focusedSessionId = sessionId
+
+        let line = TerminalLine(text: "Interrupting current task…", type: .system, sessionId: sessionId)
+        terminalBuffer.append(line)
+        recentTerminalLines = terminalBuffer.getLast(15)
+        appendToSession(line, sessionId: sessionId)
+
+        Task {
+            do {
+                try await bridgeClient.interruptSession(sessionId: sessionId, replacementCommand: text)
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    func spawnDesktopSession(agent: AgentType, cwd: String?, initialCommand: String? = nil) {
+        let line = TerminalLine(
+            text: "Opening new \(agent.rawValue) session on Mac…",
+            type: .system
+        )
+        terminalBuffer.append(line)
+        recentTerminalLines = terminalBuffer.getLast(15)
+
+        Task {
+            do {
+                let sessionId = try await bridgeClient.spawnSession(
+                    agent: agent.rawValue,
+                    cwd: cwd,
+                    openDesktopWindow: true,
+                    initialCommand: initialCommand
+                )
+                await MainActor.run {
+                    if let sessionId {
+                        self.focusedSessionId = sessionId
+                    }
+                }
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    func openSessionOnMac(sessionId: String) {
+        if let session = sessions.first(where: { $0.id == sessionId }) {
+            let line = TerminalLine(
+                text: "Opening \(session.agent.rawValue) terminal on Mac…",
+                type: .system,
+                sessionId: sessionId
+            )
+            terminalBuffer.append(line)
+            appendToSession(line, sessionId: sessionId)
+            recentTerminalLines = terminalBuffer.getLast(15)
+        }
+
+        Task {
+            do {
+                try await bridgeClient.openDesktopWindow(sessionId: sessionId)
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch let BridgeClient.BridgeError.serverError(message) {
+                await MainActor.run {
+                    let line = TerminalLine(text: message, type: .error, sessionId: sessionId)
+                    self.terminalBuffer.append(line)
+                    self.appendToSession(line, sessionId: sessionId)
+                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                }
+            } catch {
+                await MainActor.run {
+                    let line = TerminalLine(text: error.localizedDescription, type: .error, sessionId: sessionId)
+                    self.terminalBuffer.append(line)
+                    self.appendToSession(line, sessionId: sessionId)
+                    self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                }
+            }
+        }
+    }
+
+    func removeSession(sessionId: String) {
+        Task {
+            do {
+                try await bridgeClient.removeSession(sessionId: sessionId)
+            } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.handleBridgeAuthRejected() }
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    func focusSession(_ sessionId: String?) {
+        focusedSessionId = sessionId
     }
 
     // MARK: - Clear terminal
 
     func clearTerminal(sessionId: String? = nil) {
-        if let sid = sessionId,
-           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+        if let sid = sessionId {
+            if let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                sessions[idx].terminalLines.removeAll()
+            }
+            pendingTerminalLines.removeAll { $0.sessionId == sid }
+            recentTerminalLines.removeAll { $0.sessionId == sid }
+            return
+        }
+
+        for idx in sessions.indices {
             sessions[idx].terminalLines.removeAll()
         }
         terminalBuffer.clear()
+        pendingTerminalLines.removeAll()
         recentTerminalLines = []
         isThinking = false
     }
@@ -426,6 +705,7 @@ final class RelayService: ObservableObject {
 
     private func clearPendingApproval(for approval: ApprovalRequest) {
         pendingApproval = nil
+        pendingApprovalSessionId = nil
         for idx in sessions.indices {
             if sessions[idx].pendingApproval?.permissionId == approval.permissionId {
                 sessions[idx].pendingApproval = nil
@@ -434,15 +714,131 @@ final class RelayService: ObservableObject {
                 }
             }
         }
+        publishSessions()
     }
 
     private func appendToSession(_ line: TerminalLine, sessionId: String?) {
         guard let sid = sessionId,
-              let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
+              let idx = indexForSession(id: sid) else { return }
         sessions[idx].terminalLines.append(line)
-        if sessions[idx].terminalLines.count > 200 {
-            sessions[idx].terminalLines.removeFirst(sessions[idx].terminalLines.count - 200)
+        if sessions[idx].terminalLines.count > 600 {
+            sessions[idx].terminalLines.removeFirst(sessions[idx].terminalLines.count - 600)
         }
+    }
+
+    private func appendToSessionIfNotDuplicate(_ line: TerminalLine, sessionId: String?) -> Bool {
+        guard let sid = sessionId,
+              let idx = indexForSession(id: sid) else { return false }
+
+        if sessions[idx].terminalLines.suffix(6).contains(where: {
+            $0.type == line.type && $0.text == line.text
+        }) {
+            return false
+        }
+
+        appendToSession(line, sessionId: sid)
+        return true
+    }
+
+    private func setActivity(_ activity: SessionActivity, for sessionId: String) {
+        guard let idx = indexForSession(id: sessionId) else { return }
+        sessions[idx].activity = activity
+    }
+
+    private func markSessionVisualActivity(_ sessionId: String?) {
+        guard let sessionId, let idx = indexForSession(id: sessionId) else { return }
+        sessions[idx].lastVisualActivityAt = Date()
+    }
+
+    private func session(for sessionId: String) -> AgentSession? {
+        guard let idx = indexForSession(id: sessionId) else { return nil }
+        return sessions[idx]
+    }
+
+    private func indexForSession(
+        id: String? = nil,
+        externalSessionId: String? = nil,
+        tmuxSessionName: String? = nil
+    ) -> Int? {
+        if let id, let exact = sessions.firstIndex(where: { $0.id == id }) {
+            return exact
+        }
+
+        if let id, let alias = sessions.firstIndex(where: { $0.externalSessionId == id }) {
+            return alias
+        }
+
+        if let externalSessionId,
+           let exactExternal = sessions.firstIndex(where: { $0.externalSessionId == externalSessionId }) {
+            return exactExternal
+        }
+
+        if let tmuxSessionName,
+           let exactTmux = sessions.firstIndex(where: { $0.tmuxSessionName == tmuxSessionName }) {
+            return exactTmux
+        }
+
+        return nil
+    }
+
+    private func sanitizeTerminalText(_ text: String) -> String {
+        let withoutOsc = text.replacingOccurrences(
+            of: "\\u{001B}\\][^\\u{0007}\\u{001B}]*(\\u{0007}|\\u{001B}\\\\)",
+            with: "",
+            options: .regularExpression
+        )
+        let withoutCsi = withoutOsc.replacingOccurrences(
+            of: "\\u{001B}\\[[0-9;?]*[ -/]*[@-~]",
+            with: "",
+            options: .regularExpression
+        )
+        let withoutEscapes = withoutCsi.replacingOccurrences(
+            of: "\\u{001B}[()][A-Za-z0-9]",
+            with: "",
+            options: .regularExpression
+        )
+        return withoutEscapes
+            .replacingOccurrences(of: "\r", with: "")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .controlCharacters) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+
+    private func shouldDisplayPtyOutput(_ text: String, sessionId: String?, isBootstrap: Bool = false) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        guard let sessionId, let session = session(for: sessionId), session.sharedTerminal else {
+            return true
+        }
+
+        return isBootstrap
+            || trimmed.hasPrefix("[queued prompt]")
+            || trimmed.hasPrefix("[launching]")
+            || trimmed == "^C"
+    }
+
+    private func handlePermissionCleared(_ data: String) {
+        guard let json = parseJSON(data) else { return }
+
+        let permissionId = json["permissionId"] as? String
+        if let current = pendingApproval,
+           (permissionId == nil || current.permissionId == permissionId) {
+            clearPendingApproval(for: current)
+            return
+        }
+
+        for idx in sessions.indices {
+            if permissionId == nil || sessions[idx].pendingApproval?.permissionId == permissionId {
+                sessions[idx].pendingApproval = nil
+                if sessions[idx].activity == .waitingApproval {
+                    sessions[idx].activity = .running
+                }
+            }
+        }
+        pendingApprovalSessionId = nil
+        publishSessions()
     }
 
     private func handleSessionEvent(_ data: String) {
@@ -453,21 +849,59 @@ final class RelayService: ObservableObject {
         let agent = json["agent"] as? String
         let cwd = json["cwd"] as? String ?? ""
         let folderName = json["folderName"] as? String ?? ""
+        let backend = json["backend"] as? String ?? "external"
+        let writable = json["writable"] as? Bool ?? false
+        let sharedTerminal = json["sharedTerminal"] as? Bool ?? (backend == "tmux")
+        let externalSessionId = json["externalSessionId"] as? String
+        let tmuxSessionName = json["tmuxSessionName"] as? String
+        let lastActivityAt = json["lastActivityAt"] as? TimeInterval
 
         switch state {
         case "running":
             sessionStartDate = Date()
             if let sid = sessionId {
-                if let idx = sessions.firstIndex(where: { $0.id == sid }) {
-                    sessions[idx].activity = .running
+                if let idx = indexForSession(id: sid, externalSessionId: externalSessionId, tmuxSessionName: tmuxSessionName) {
+                    let existingLines = sessions[idx].terminalLines
+                    let existingApproval = sessions[idx].pendingApproval
+                    let existingActivity = sessions[idx].activity
+                    let previousId = sessions[idx].id
+                    let agentType = AgentType(rawValue: agent ?? sessions[idx].agent.rawValue) ?? sessions[idx].agent
+                    var updated = AgentSession(
+                        id: sid,
+                        agent: agentType,
+                        cwd: cwd.isEmpty ? sessions[idx].cwd : cwd,
+                        folderName: folderName.isEmpty ? sessions[idx].folderName : folderName,
+                        activity: existingActivity == .waitingApproval ? .waitingApproval : .idle,
+                        backend: backend,
+                        writable: writable,
+                        sharedTerminal: sharedTerminal,
+                        externalSessionId: externalSessionId ?? sessions[idx].externalSessionId,
+                        tmuxSessionName: tmuxSessionName ?? sessions[idx].tmuxSessionName,
+                        lastActivityAt: lastActivityAt ?? sessions[idx].lastActivityAt
+                    )
+                    updated.terminalLines = existingLines
+                    updated.pendingApproval = existingApproval
+                    updated.lastVisualActivityAt = sessions[idx].lastVisualActivityAt
+                    sessions[idx] = updated
+                    if focusedSessionId == previousId {
+                        focusedSessionId = sid
+                    }
                 } else {
                     let agentType = AgentType(rawValue: agent ?? "claude") ?? .claude
                     sessions.append(AgentSession(
                         id: sid, agent: agentType, cwd: cwd,
-                        folderName: folderName, activity: .running
+                        folderName: folderName, activity: .idle,
+                        backend: backend,
+                        writable: writable,
+                        sharedTerminal: sharedTerminal,
+                        externalSessionId: externalSessionId,
+                        tmuxSessionName: tmuxSessionName,
+                        lastActivityAt: lastActivityAt
                     ))
+                    focusedSessionId = sid
                 }
             }
+            claimPendingApprovalIfNeeded(preferredSessionId: sessionId ?? externalSessionId)
         case "ended":
             isThinking = false
             stopElapsedTimer()
@@ -484,6 +918,184 @@ final class RelayService: ObservableObject {
         updateWatchState()
     }
 
+    private func handleSessionRemoved(_ data: String) {
+        guard let json = parseJSON(data),
+              let sessionId = json["sessionId"] as? String else { return }
+
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions.remove(at: idx)
+        }
+
+        pendingTerminalLines.removeAll { $0.sessionId == sessionId }
+        recentTerminalLines.removeAll { $0.sessionId == sessionId }
+
+        if focusedSessionId == sessionId {
+            focusedSessionId = preferredSessionId()
+            isThinking = false
+        }
+
+        if sessions.isEmpty {
+            isThinking = false
+        }
+
+        if pendingApproval?.permissionId != nil,
+           !sessions.contains(where: { $0.pendingApproval?.permissionId == pendingApproval?.permissionId }) {
+            pendingApproval = nil
+            pendingApprovalSessionId = nil
+        }
+
+        updateWatchState()
+    }
+
+    private func handleSessionHeartbeat(_ data: String) {
+        guard parseJSON(data)?["sessionId"] as? String != nil else { return }
+    }
+
+    private func handlePollStatus(_ data: String) {
+        guard let json = parseJSON(data) else { return }
+
+        connectionState = .connected
+        if let bridgeState = json["state"] as? String,
+           bridgeState == "connected" || bridgeState == "idle" {
+            lastConnected = Date()
+        }
+
+        guard let rawSessions = json["sessions"] as? [[String: Any]] else {
+            return
+        }
+
+        let previousFocused = focusedSessionId
+        var syncedSessions: [AgentSession] = []
+
+        for raw in rawSessions {
+            guard let sessionId = raw["id"] as? String else { continue }
+
+            let agent = AgentType(rawValue: raw["agent"] as? String ?? "claude") ?? .claude
+            let cwd = raw["cwd"] as? String ?? ""
+            let folderName = raw["folderName"] as? String ?? ""
+            let state = raw["state"] as? String ?? "idle"
+            let backend = raw["backend"] as? String ?? "external"
+            let writable = raw["writable"] as? Bool ?? false
+            let sharedTerminal = raw["sharedTerminal"] as? Bool ?? (backend == "tmux")
+            let externalSessionId = raw["externalSessionId"] as? String
+            let tmuxSessionName = raw["tmuxSessionName"] as? String
+            let lastActivityAt = raw["lastActivityAt"] as? TimeInterval
+
+            let existingIndex = indexForSession(
+                id: sessionId,
+                externalSessionId: externalSessionId,
+                tmuxSessionName: tmuxSessionName
+            )
+            let existing = existingIndex.flatMap { sessions.indices.contains($0) ? sessions[$0] : nil }
+
+            let activity: SessionActivity = {
+                if existing?.pendingApproval != nil || existing?.activity == .waitingApproval {
+                    return .waitingApproval
+                }
+                switch state {
+                case "running": return .running
+                case "ended": return .ended
+                default: return .idle
+                }
+            }()
+
+            var synced = AgentSession(
+                id: sessionId,
+                agent: agent,
+                cwd: cwd,
+                folderName: folderName,
+                activity: activity,
+                backend: backend,
+                writable: writable,
+                sharedTerminal: sharedTerminal,
+                externalSessionId: externalSessionId,
+                tmuxSessionName: tmuxSessionName,
+                lastActivityAt: lastActivityAt
+            )
+            synced.terminalLines = existing?.terminalLines ?? []
+            synced.pendingApproval = existing?.pendingApproval
+            synced.lastVisualActivityAt = existing?.lastVisualActivityAt
+            syncedSessions.append(synced)
+        }
+
+        sessions = syncedSessions
+        claimPendingApprovalIfNeeded()
+
+        if let previousFocused,
+           sessions.contains(where: { $0.id == previousFocused }) {
+            focusedSessionId = previousFocused
+        } else if focusedSessionId == nil || !sessions.contains(where: { $0.id == focusedSessionId }) {
+            focusedSessionId = preferredSessionId()
+        }
+
+        if pendingApproval?.permissionId != nil,
+           !sessions.contains(where: { $0.pendingApproval?.permissionId == pendingApproval?.permissionId }) {
+            pendingApproval = nil
+            pendingApprovalSessionId = nil
+        }
+
+        if sessions.isEmpty {
+            isThinking = false
+        }
+
+        updateWatchState()
+    }
+
+    private func handleConversationMessage(_ data: String) {
+        guard let json = parseJSON(data),
+              let role = json["role"] as? String,
+              let text = json["text"] as? String else { return }
+
+        let sessionId = json["sessionId"] as? String
+        let phase = json["phase"] as? String
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let line: TerminalLine
+        switch role {
+        case "user":
+            line = TerminalLine(text: "> \(trimmed)", type: .command, sessionId: sessionId)
+        case "assistant":
+            line = TerminalLine(text: trimmed, type: .output, sessionId: sessionId)
+        default:
+            return
+        }
+
+        let appended = appendToSessionIfNotDuplicate(line, sessionId: sessionId)
+        let shouldSkipSessionAppend = appended
+        if !appended,
+           let sid = sessionId,
+           let session = session(for: sid),
+           session.sharedTerminal {
+            return
+        }
+
+        terminalBuffer.append(line)
+        recentTerminalLines = terminalBuffer.getLast(15)
+        if !shouldSkipSessionAppend {
+            appendToSession(line, sessionId: sessionId)
+        }
+
+        if let sid = sessionId {
+            if role == "user" {
+                setActivity(.running, for: sid)
+                markSessionVisualActivity(sid)
+                if focusedSessionId == nil || focusedSessionId == sid {
+                    isThinking = true
+                }
+            } else if role == "assistant" {
+                setActivity(.running, for: sid)
+                markSessionVisualActivity(sid)
+                if focusedSessionId == nil || focusedSessionId == sid {
+                    isThinking = phase != "final_answer"
+                }
+            }
+        }
+
+        pendingTerminalLines.append(line)
+        scheduleBatchSend()
+    }
+
     private func handleToolOutput(_ data: String) {
         guard let json = parseJSON(data) else { return }
         let toolName = json["tool_name"] as? String ?? "tool"
@@ -492,6 +1104,16 @@ final class RelayService: ObservableObject {
         let sessionId = json["sessionId"] as? String
         let source = json["source"] as? String ?? "claude"
         let prefix = source == "codex" ? "[codex] " : ""
+        let sharedSession = sessionId.flatMap { session(for: $0) }?.sharedTerminal == true
+
+        if sharedSession {
+            return
+        }
+
+        if let sid = sessionId {
+            setActivity(.running, for: sid)
+            markSessionVisualActivity(sid)
+        }
 
         // Format like a real terminal: show what Claude did and the result
         var lines: [TerminalLine] = []
@@ -552,7 +1174,7 @@ final class RelayService: ObservableObject {
 
         case "CodexMessage":
             if let output = toolOutput {
-                lines.append(TerminalLine(text: "\(prefix)\(String(output.prefix(100)))", type: .output, sessionId: sessionId))
+                lines.append(TerminalLine(text: "\(prefix)\(output)", type: .output, sessionId: sessionId))
             }
 
         default:
@@ -579,10 +1201,15 @@ final class RelayService: ObservableObject {
     }
 
     private func handleTaskComplete(_ data: String) {
+        let sessionId = parseJSON(data)?["sessionId"] as? String
         isThinking = false
-        let line = TerminalLine(text: "Task completed", type: .system)
+        let line = TerminalLine(text: "Task completed", type: .system, sessionId: sessionId)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
+        appendToSession(line, sessionId: sessionId)
+        if let sid = sessionId {
+            setActivity(.idle, for: sid)
+        }
         notificationService.postTaskComplete()
         updateWatchState()
     }
@@ -596,10 +1223,15 @@ final class RelayService: ObservableObject {
     }
 
     private func handleStop(_ data: String) {
+        let sessionId = parseJSON(data)?["sessionId"] as? String
         isThinking = false
-        let line = TerminalLine(text: "Session stopped", type: .system)
+        let line = TerminalLine(text: "Session stopped", type: .system, sessionId: sessionId)
         terminalBuffer.append(line)
         recentTerminalLines = terminalBuffer.getLast(15)
+        appendToSession(line, sessionId: sessionId)
+        if let sid = sessionId {
+            setActivity(.idle, for: sid)
+        }
         updateWatchState()
     }
 
@@ -713,10 +1345,99 @@ final class RelayService: ObservableObject {
         elapsedTimer = nil
     }
 
+    private func claimPendingApprovalIfNeeded(preferredSessionId: String? = nil) {
+        guard let approval = pendingApproval else { return }
+
+        let requestedSessionId = preferredSessionId ?? pendingApprovalSessionId
+        var targetIndex: Int? = nil
+
+        if let requestedSessionId {
+            targetIndex = indexForSession(id: requestedSessionId, externalSessionId: requestedSessionId)
+        }
+
+        if targetIndex == nil,
+           let permissionId = approval.permissionId {
+            targetIndex = sessions.firstIndex(where: { $0.pendingApproval?.permissionId == permissionId })
+        }
+
+        guard let idx = targetIndex else { return }
+
+        let resolvedSessionId = sessions[idx].id
+        var didChange = false
+
+        if sessions[idx].pendingApproval?.permissionId != approval.permissionId {
+            sessions[idx].pendingApproval = approval
+            didChange = true
+        }
+
+        if sessions[idx].activity != .waitingApproval {
+            sessions[idx].activity = .waitingApproval
+            didChange = true
+        }
+
+        if focusedSessionId != resolvedSessionId {
+            focusedSessionId = resolvedSessionId
+        }
+
+        pendingApprovalSessionId = resolvedSessionId
+        isThinking = false
+
+        if didChange {
+            publishSessions()
+        }
+    }
+
+    private func publishSessions() {
+        sessions = sessions
+    }
+
+    private func preferredSessionId() -> String? {
+        if let approvalSessionId = pendingApprovalSessionId,
+           let idx = indexForSession(id: approvalSessionId, externalSessionId: approvalSessionId) {
+            return sessions.indices.contains(idx) ? sessions[idx].id : nil
+        }
+
+        if let managed = mostRecentSession(where: {
+            $0.writable && ($0.tmuxSessionName?.hasPrefix("agent-watch-") == true)
+        }) {
+            return managed.id
+        }
+
+        if let shared = mostRecentSession(where: { $0.sharedTerminal }) {
+            return shared.id
+        }
+
+        if let writable = mostRecentSession(where: { $0.writable }) {
+            return writable.id
+        }
+
+        return mostRecentSession(where: { _ in true })?.id
+    }
+
+    private func mostRecentSession(where predicate: (AgentSession) -> Bool) -> AgentSession? {
+        sessions
+            .filter(predicate)
+            .max { lhs, rhs in
+                (lhs.lastActivityAt ?? 0) < (rhs.lastActivityAt ?? 0)
+            }
+    }
+
     // MARK: - JSON helpers
 
     private func parseJSON(_ string: String) -> [String: Any]? {
         guard let data = string.data(using: .utf8) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private func handleBridgeAuthRejected() {
+        pairingNotice = "Saved pairing expired because the bridge restarted. Re-pair with the new 6-digit code from your Mac."
+        connectionState = .disconnected
+        unpair()
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

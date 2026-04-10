@@ -49,6 +49,8 @@
 		CA6DD0BE4E438FDF85EC6481 /* VoiceInputView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B4CE22624BFF32BAC9AD1D8 /* VoiceInputView.swift */; };
 		D33D58F16A5735DE24FB6102 /* TerminalLine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FDEABAF052B796E83242EB1 /* TerminalLine.swift */; };
 		D73C73D521E0F95B2C18CC7B /* Color+Hex.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1DF2BEEDD4C382E734A9998 /* Color+Hex.swift */; };
+		DB9D63272F863ACB00A652F3 /* URLRequest+CF.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB9D63262F863ACB00A652F3 /* URLRequest+CF.swift */; };
+		DB9D63282F863ACB00A652F3 /* URLRequest+CF.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB9D63262F863ACB00A652F3 /* URLRequest+CF.swift */; };
 		DCE274895FA3FD6E784C9F57 /* ApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98B6945BBB9FD551235039E4 /* ApprovalView.swift */; };
 		E98F410B3104C20DA98FCDD4 /* Color+Hex.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1DF2BEEDD4C382E734A9998 /* Color+Hex.swift */; };
 		ED44F4F97DC4EA01CA9CA7EF /* ClaudeMascot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B94DD051BD503B11365D6B9 /* ClaudeMascot.swift */; };
@@ -115,6 +117,7 @@
 		D1DF2BEEDD4C382E734A9998 /* Color+Hex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Color+Hex.swift"; sourceTree = "<group>"; };
 		D2084D859AEDF739A7B8CD49 /* ConnectionStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStatusView.swift; sourceTree = "<group>"; };
 		D315314A06584F20A95E7DB6 /* WatchMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchMessage.swift; sourceTree = "<group>"; };
+		DB9D63262F863ACB00A652F3 /* URLRequest+CF.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "URLRequest+CF.swift"; sourceTree = "<group>"; };
 		E05A5819BA45145C8992456D /* ComplicationProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComplicationProvider.swift; sourceTree = "<group>"; };
 		F237360F4AF9396B7B3C1881 /* AgentIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentIcon.swift; sourceTree = "<group>"; };
 		F4BB0DBA06997A7A93FE5E2F /* ClaudeWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeWatchApp.swift; sourceTree = "<group>"; };
@@ -179,6 +182,7 @@
 		42039F830784336C1F2771D2 /* Extensions */ = {
 			isa = PBXGroup;
 			children = (
+				DB9D63262F863ACB00A652F3 /* URLRequest+CF.swift */,
 				F237360F4AF9396B7B3C1881 /* AgentIcon.swift */,
 				7B94DD051BD503B11365D6B9 /* ClaudeMascot.swift */,
 				234623B6E982F519BDC3EF6D /* CodexLogo.swift */,
@@ -383,6 +387,7 @@
 				90B7313C239B5B0D98D9CF7F /* ApprovalRequest.swift in Sources */,
 				7444DC329E5872F468957C9B /* BonjourDiscovery.swift in Sources */,
 				A4537D76D204EE5733D1E5EE /* BridgeClient.swift in Sources */,
+				DB9D63272F863ACB00A652F3 /* URLRequest+CF.swift in Sources */,
 				28EAB75269BCCCC967B9CBC3 /* ClaudeMascot.swift in Sources */,
 				9E5D88133812A8C54BE8B335 /* ClaudeWatchApp.swift in Sources */,
 				2FF16E65BC48434288D37C29 /* CodexLogo.swift in Sources */,
@@ -419,6 +424,7 @@
 				3567322839F9B7C8982E2CC2 /* OnboardingView.swift in Sources */,
 				BE5F367582BDDF887D2B9676 /* OutputRingBuffer.swift in Sources */,
 				5878B94D3BB58C30DCBFB3AF /* SessionState.swift in Sources */,
+				DB9D63282F863ACB00A652F3 /* URLRequest+CF.swift in Sources */,
 				33760C5A9FFC556535CF3809 /* SessionView.swift in Sources */,
 				45ACE32BBF4381937CE61A77 /* SpeechService.swift in Sources */,
 				1D59400FB238BFA588E37DB1 /* StatusDashboard.swift in Sources */,
@@ -447,14 +453,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = T7HT4U4666;
+				DEVELOPMENT_TEAM = SF9F57P2JZ;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "ClaudeWatch iOS/Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.shobhit.claudewatch;
+				PRODUCT_BUNDLE_IDENTIFIER = com.nightwatcherphone.han;
 				PRODUCT_NAME = "Agent Watch";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -470,11 +476,11 @@
 					arm64_32,
 				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				DEVELOPMENT_TEAM = T7HT4U4666;
+				DEVELOPMENT_TEAM = SF9F57P2JZ;
 				"EXCLUDED_ARCHS[sdk=watchsimulator*]" = arm64e;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "ClaudeWatch watchOS/Info.plist";
-				PRODUCT_BUNDLE_IDENTIFIER = com.shobhit.claudewatch.watchkitapp;
+				PRODUCT_BUNDLE_IDENTIFIER = com.nightwatcherphone.han.watchkitapp;
 				PRODUCT_NAME = "Agent Watch";
 				SDKROOT = watchos;
 				SKIP_INSTALL = YES;
@@ -492,10 +498,11 @@
 					arm64_32,
 				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				DEVELOPMENT_TEAM = SF9F57P2JZ;
 				"EXCLUDED_ARCHS[sdk=watchsimulator*]" = arm64e;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "ClaudeWatch watchOS/Info.plist";
-				PRODUCT_BUNDLE_IDENTIFIER = com.shobhit.claudewatch.watchkitapp;
+				PRODUCT_BUNDLE_IDENTIFIER = com.nightwatcherphone.han.watchkitapp;
 				PRODUCT_NAME = "Agent Watch";
 				SDKROOT = watchos;
 				SKIP_INSTALL = YES;
@@ -629,13 +636,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = SF9F57P2JZ;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "ClaudeWatch iOS/Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.shobhit.claudewatch;
+				PRODUCT_BUNDLE_IDENTIFIER = com.nightwatcherphone.han;
 				PRODUCT_NAME = "Agent Watch";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";

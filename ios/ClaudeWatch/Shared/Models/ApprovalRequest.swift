@@ -9,6 +9,9 @@ struct ApprovalRequest: Identifiable, Codable {
     var status: ApprovalStatus
     var question: String?
     var options: [OptionItem]
+    /// True when the session is a read-only external terminal.
+    /// The approval is shown as a notification only; the user must respond in the Mac terminal.
+    var readOnly: Bool = false
 
     enum ApprovalStatus: String, Codable {
         case pending
@@ -29,7 +32,7 @@ struct ApprovalRequest: Identifiable, Codable {
         }
     }
 
-    init(permissionId: String? = nil, toolName: String, actionSummary: String, question: String? = nil, options: [OptionItem] = []) {
+    init(permissionId: String? = nil, toolName: String, actionSummary: String, question: String? = nil, options: [OptionItem] = [], readOnly: Bool = false) {
         self.id = UUID()
         self.permissionId = permissionId
         self.toolName = toolName
@@ -38,5 +41,6 @@ struct ApprovalRequest: Identifiable, Codable {
         self.status = .pending
         self.question = question
         self.options = options
+        self.readOnly = readOnly
     }
 }

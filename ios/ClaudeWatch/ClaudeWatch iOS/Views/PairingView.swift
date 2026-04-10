@@ -16,6 +16,16 @@ struct PairingView: View {
     @State private var errorMessage: String = ""
     @State private var isConnecting: Bool = false
 
+    // Cloudflare Access credentials (for remote access via Cloudflare Tunnel)
+    @State private var cfClientId: String = UserDefaults.standard.string(forKey: "cf_client_id") ?? ""
+    @State private var cfClientSecret: String = UserDefaults.standard.string(forKey: "cf_client_secret") ?? ""
+
+    /// True when the user enters a domain name (not a plain IP).
+    private var isCloudflareMode: Bool {
+        ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            .contains(where: { $0.isLetter })
+    }
+
     // MARK: - Body
 
     var body: some View {
@@ -30,6 +40,10 @@ struct PairingView: View {
 
                 if showManualIP {
                     ipEntrySection
+
+                    if isCloudflareMode {
+                        cloudflareSection
+                    }
                 }
 
                 digitFields
@@ -65,8 +79,9 @@ struct PairingView: View {
 
     private var ipEntrySection: some View {
         HStack(spacing: 8) {
-            TextField("192.168.1.x", text: $ipAddress)
-                .keyboardType(.decimalPad)
+            TextField("192.168.1.x or watch.example.com", text: $ipAddress)
+                .keyboardType(.URL)
+                .autocorrectionDisabled()
                 .font(.system(size: 17, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
                 .tint(Color.claudeOrange)
@@ -81,6 +96,51 @@ struct PairingView: View {
                 )
                 .focused($isIPFocused)
         }
+    }
+
+    private var cloudflareSection: some View {
+        VStack(spacing: 10) {
+            Text("Cloudflare Access")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.claudeOrange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            TextField("CF-Access-Client-Id", text: $cfClientId)
+                .font(.system(size: 14, design: .monospaced))
+                .foregroundStyle(.white)
+                .tint(Color.claudeOrange)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.cardBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.fieldBorder, lineWidth: 1)
+                )
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            SecureField("CF-Access-Client-Secret", text: $cfClientSecret)
+                .font(.system(size: 14, design: .monospaced))
+                .foregroundStyle(.white)
+                .tint(Color.claudeOrange)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.cardBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.fieldBorder, lineWidth: 1)
+                )
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            Text("Get these from Cloudflare Zero Trust → Access → Service Auth")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.subtleText)
+        }
+        .transition(.opacity.combined(with: .move(edge: .top)))
+        .animation(.easeInOut(duration: 0.25), value: isCloudflareMode)
     }
 
     private var digitFields: some View {
@@ -141,6 +201,13 @@ struct PairingView: View {
                 .multilineTextAlignment(.center)
                 .transition(.opacity)
                 .padding(.top, 4)
+        } else if let pairingNotice = relayService.pairingNotice {
+            Text(pairingNotice)
+                .font(.system(size: 14))
+                .foregroundStyle(Color.claudeAmber)
+                .multilineTextAlignment(.center)
+                .transition(.opacity)
+                .padding(.top, 4)
         }
     }
 
@@ -180,6 +247,10 @@ struct PairingView: View {
             code = filtered
         }
 
+        if !filtered.isEmpty {
+            relayService.clearPairingNotice()
+        }
+
         if showError {
             withAnimation(.easeOut(duration: 0.2)) {
                 showError = false
@@ -200,14 +271,22 @@ struct PairingView: View {
         Task {
             do {
                 if showManualIP {
-                    let ip = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !ip.isEmpty else {
+                    let input = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !input.isEmpty else {
                         await MainActor.run {
-                            showPairingError("Please enter your Mac's IP address.")
+                            showPairingError("Please enter your Mac's IP or Cloudflare URL.")
                         }
                         return
                     }
-                    try await relayService.pairWithIP(ip, code: code)
+                    // Detect Cloudflare URL (contains letters) vs plain IP (only digits/dots)
+                    let isCloudflareURL = input.contains(where: { $0.isLetter })
+                    if isCloudflareURL {
+                        // Save CF credentials before pairing so headers are included
+                        saveCFCredentials()
+                        try await relayService.pairWithURL(input, code: code)
+                    } else {
+                        try await relayService.pairWithIP(input, code: code)
+                    }
                 } else {
                     try await relayService.pair(code: code)
                 }
@@ -238,6 +317,8 @@ struct PairingView: View {
             showPairingError("Code expired. A new code has been generated on your Mac.")
         case .rateLimited:
             showPairingError("Too many attempts. Please wait a few minutes.")
+        case .unauthorized:
+            showPairingError("Bridge session expired. Restart the bridge if needed, then pair again with the new 6-digit code.")
         case .networkError:
             if !showManualIP {
                 showManualIP = true
@@ -274,6 +355,15 @@ struct PairingView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             shakeOffset = 0
         }
+    }
+
+    /// Persists CF credentials to UserDefaults and syncs to Apple Watch via WCSession.
+    private func saveCFCredentials() {
+        let id = cfClientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secret = cfClientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(id, forKey: "cf_client_id")
+        UserDefaults.standard.set(secret, forKey: "cf_client_secret")
+        WatchSessionManager.shared.syncCloudflareCredentials(clientId: id, clientSecret: secret)
     }
 }
 

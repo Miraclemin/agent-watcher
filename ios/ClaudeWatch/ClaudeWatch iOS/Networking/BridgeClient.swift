@@ -9,6 +9,7 @@ final class BridgeClient {
         case invalidCode
         case expired
         case rateLimited
+        case unauthorized
         case networkError
         case serverError(String)
 
@@ -17,6 +18,7 @@ final class BridgeClient {
             case .invalidCode:      return "Invalid pairing code."
             case .expired:          return "Pairing code expired."
             case .rateLimited:      return "Too many attempts. Try again later."
+            case .unauthorized:     return "Bridge session expired. Please pair again."
             case .networkError:     return "Cannot reach bridge server."
             case .serverError(let msg): return msg
             }
@@ -51,6 +53,14 @@ final class BridgeClient {
         let urlString = "http://\(host):\(port)"
         self.baseURL = URL(string: urlString)
         UserDefaults.standard.set(urlString, forKey: "bridge_url")
+    }
+
+    /// Configures the client with a full URL string (e.g. https://watch.example.com for Cloudflare Tunnel).
+    func configureURL(_ urlString: String) {
+        var s = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.hasPrefix("http") { s = "https://" + s }
+        self.baseURL = URL(string: s)
+        UserDefaults.standard.set(s, forKey: "bridge_url")
     }
 
     var isPaired: Bool {
@@ -119,9 +129,19 @@ final class BridgeClient {
     }
 
     /// Spawns a new agent session.
-    func spawnSession(agent: String, cwd: String? = nil) async throws -> String {
+    @discardableResult
+    func spawnSession(
+        agent: String,
+        cwd: String? = nil,
+        openDesktopWindow: Bool = false,
+        initialCommand: String? = nil
+    ) async throws -> String? {
         var body: [String: Any] = ["spawn": agent]
         if let cwd { body["cwd"] = cwd }
+        if openDesktopWindow { body["openDesktopWindow"] = true }
+        if let initialCommand, !initialCommand.isEmpty {
+            body["command"] = initialCommand.hasSuffix("\n") ? initialCommand : initialCommand + "\n"
+        }
         guard let baseURL, let token else { throw BridgeError.networkError }
         let url = baseURL.appendingPathComponent("command")
         var request = URLRequest(url: url)
@@ -131,11 +151,59 @@ final class BridgeClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await performRequest(request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+            throw BridgeError.unauthorized
+        }
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw BridgeError.serverError("Failed to spawn session")
+            let body = try? JSONDecoder().decode(ErrorResponse.self, from: data)
+            throw BridgeError.serverError(body?.error ?? "Failed to spawn session")
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        return json?["sessionId"] as? String ?? ""
+        return json?["sessionId"] as? String
+    }
+
+    func queueCommand(text: String, sessionId: String) async throws {
+        let body: [String: Any] = [
+            "queueNext": true,
+            "sessionId": sessionId,
+            "command": text.hasSuffix("\n") ? text : text + "\n"
+        ]
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    func interruptSession(sessionId: String, replacementCommand: String? = nil) async throws {
+        var body: [String: Any] = [
+            "interrupt": true,
+            "sessionId": sessionId
+        ]
+        if let replacementCommand, !replacementCommand.isEmpty {
+            body["command"] = replacementCommand.hasSuffix("\n") ? replacementCommand : replacementCommand + "\n"
+        }
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    func openDesktopWindow(sessionId: String) async throws {
+        let body: [String: Any] = [
+            "sessionId": sessionId,
+            "openDesktopWindow": true
+        ]
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    func removeSession(sessionId: String) async throws {
+        let body: [String: Any] = [
+            "kill": true,
+            "sessionId": sessionId
+        ]
+        try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    func sendHeartbeat(sessionId: String? = nil) async throws {
+        var body: [String: Any] = [:]
+        if let sessionId {
+            body["sessionId"] = sessionId
+        }
+        try await authenticatedPostRaw(path: "heartbeat", body: body)
     }
 
     /// Responds to an approval request.
@@ -210,8 +278,13 @@ final class BridgeClient {
         request.httpBody = try JSONEncoder().encode(body)
 
         let (_, response) = try await performRequest(request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw BridgeError.networkError
+        }
+        if httpResponse.statusCode == 401 {
+            throw BridgeError.unauthorized
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
             throw BridgeError.serverError("Request failed")
         }
     }
@@ -225,16 +298,24 @@ final class BridgeClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await performRequest(request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
-            throw BridgeError.serverError("Request failed")
+        let (data, response) = try await performRequest(request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw BridgeError.networkError
+        }
+        if httpResponse.statusCode == 401 {
+            throw BridgeError.unauthorized
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let body = try? JSONDecoder().decode(ErrorResponse.self, from: data)
+            throw BridgeError.serverError(body?.error ?? "Request failed")
         }
     }
 
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            var req = request
+            req.addCloudflareAccessHeaders()
+            return try await session.data(for: req)
         } catch {
             throw BridgeError.networkError
         }
@@ -272,5 +353,10 @@ final class BridgeClient {
         let cwd: String
         let folderName: String
         let state: String
+        let backend: String?
+        let writable: Bool?
+        let sharedTerminal: Bool?
+        let externalSessionId: String?
+        let tmuxSessionName: String?
     }
 }

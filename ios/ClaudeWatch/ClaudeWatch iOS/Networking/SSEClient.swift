@@ -31,6 +31,7 @@ final class SSEClient {
 
     var onEvent: ((SSEEvent) -> Void)?
     var onStateChange: ((SSEState) -> Void)?
+    var onAuthRejected: (() -> Void)?
 
     // MARK: - Properties
 
@@ -90,6 +91,7 @@ final class SSEClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 0 // No timeout for SSE
+        request.addCloudflareAccessHeaders()
 
         if let lastEventId {
             request.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID")
@@ -200,11 +202,18 @@ final class SSEClient {
         var request = URLRequest(url: statusURL)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 5
+        request.addCloudflareAccessHeaders()
 
-        let task = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self, error == nil, let data else { return }
+            if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+                DispatchQueue.main.async {
+                    self.onAuthRejected?()
+                }
+                return
+            }
 
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil {
                 let event = SSEEvent(
                     id: nil,
                     event: "poll-status",
@@ -223,6 +232,15 @@ final class SSEClient {
     fileprivate func handleSSEConnected() {
         DispatchQueue.main.async {
             self.state = .connected
+        }
+    }
+
+    fileprivate func handleAuthRejected() {
+        stopSSE()
+        stopPolling()
+        state = .disconnected
+        DispatchQueue.main.async {
+            self.onAuthRejected?()
         }
     }
 
@@ -326,6 +344,9 @@ private final class SSESessionDelegate: NSObject, URLSessionDataDelegate {
         if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
             client?.handleSSEConnected()
             completionHandler(.allow)
+        } else if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 401 {
+            client?.handleAuthRejected()
+            completionHandler(.cancel)
         } else {
             client?.handleSSEError(nil)
             completionHandler(.cancel)

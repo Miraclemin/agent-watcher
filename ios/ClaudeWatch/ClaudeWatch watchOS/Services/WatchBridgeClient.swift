@@ -68,6 +68,7 @@ class WatchBridgeClient: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(["code": code])
+        request.addCloudflareAccessHeaders()
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw BridgeError.network }
@@ -91,6 +92,7 @@ class WatchBridgeClient: ObservableObject {
         let url = baseURL.appendingPathComponent("status")
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.addCloudflareAccessHeaders()
         let (data, _) = try await session.data(for: request)
         let status = try JSONDecoder().decode(BridgeStatus.self, from: data)
         return [BridgeEvent(state: status.state, hasPty: status.hasPty)]

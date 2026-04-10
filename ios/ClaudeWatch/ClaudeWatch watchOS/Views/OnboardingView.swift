@@ -62,11 +62,11 @@ struct OnboardingView: View {
                     .font(.system(size: 11))
                     .foregroundColor(Theme.Text.secondary)
 
-                Text("Wi-Fi not required — routes via iPhone")
+                Text("IP address or Cloudflare URL")
                     .font(.system(size: 9))
                     .foregroundColor(Theme.Text.dimmed)
 
-                TextField("192.168.1.x", text: $ipAddress)
+                TextField("192.168.1.x or watch.x.com", text: $ipAddress)
                     .font(.system(size: 16, weight: .bold, design: .monospaced))
                     .foregroundColor(Theme.Text.primary)
                     .multilineTextAlignment(.center)
@@ -106,31 +106,58 @@ struct OnboardingView: View {
     }
 
     private func connectManual() {
-        let ip = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !ip.isEmpty else { return }
+        let input = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
         isSearching = true
         error = nil
 
         Task {
-            for port in 7860...7869 {
-                let url = URL(string: "http://\(ip):\(port)/status")!
-                var request = URLRequest(url: url)
-                request.timeoutInterval = 3
+            // Detect Cloudflare URL (contains letters) vs plain IP
+            let isCloudflareURL = input.contains(where: { $0.isLetter })
+
+            if isCloudflareURL {
+                var urlString = input
+                if !urlString.hasPrefix("http") { urlString = "https://" + urlString }
+                guard let url = URL(string: urlString) else {
+                    await MainActor.run { isSearching = false; error = "Invalid URL" }
+                    return
+                }
+                var request = URLRequest(url: url.appendingPathComponent("status"))
+                request.timeoutInterval = 5
+                request.addCloudflareAccessHeaders()
                 do {
                     let (_, response) = try await URLSession.shared.data(for: request)
                     if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                         await MainActor.run {
                             isSearching = false
-                            bridgeURL = URL(string: "http://\(ip):\(port)")
+                            bridgeURL = url
                             codeFocused = true
                         }
                         return
                     }
-                } catch { continue }
-            }
-            await MainActor.run {
-                isSearching = false
-                self.error = "Can't reach \(ip)"
+                } catch {}
+                await MainActor.run { isSearching = false; error = "Can't reach \(input)" }
+            } else {
+                for port in 7860...7869 {
+                    let url = URL(string: "http://\(input):\(port)/status")!
+                    var request = URLRequest(url: url)
+                    request.timeoutInterval = 3
+                    do {
+                        let (_, response) = try await URLSession.shared.data(for: request)
+                        if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                            await MainActor.run {
+                                isSearching = false
+                                bridgeURL = URL(string: "http://\(input):\(port)")
+                                codeFocused = true
+                            }
+                            return
+                        }
+                    } catch { continue }
+                }
+                await MainActor.run {
+                    isSearching = false
+                    self.error = "Can't reach \(input)"
+                }
             }
         }
     }

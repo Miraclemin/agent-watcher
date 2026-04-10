@@ -26,6 +26,10 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Agent Watch needs to find your Mac running the bridge server on your local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Agent Watch needs microphone access so you can speak to the active terminal from your phone.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Agent Watch uses speech recognition to convert your iPhone voice input into terminal prompts.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

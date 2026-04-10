@@ -100,6 +100,18 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
     }
 
+    /// Syncs Cloudflare Access credentials to the Apple Watch.
+    /// Called from iPhone when the user saves credentials in Settings or PairingView.
+    func syncCloudflareCredentials(clientId: String, clientSecret: String) {
+        guard let session, session.isReachable || WCSession.isSupported() else { return }
+        let payload: [String: Any] = [
+            "_cfConfig": true,
+            "cf_client_id": clientId,
+            "cf_client_secret": clientSecret
+        ]
+        session.transferUserInfo(payload)
+    }
+
     #if os(iOS)
     /// Transfers complication user info to the watch.
     /// Only available on iOS; the watch reads this via `didReceiveUserInfo`.
@@ -213,6 +225,17 @@ extension WatchSessionManager: WCSessionDelegate {
     // MARK: - Private helpers
 
     private func handleIncoming(dictionary: [String: Any]) {
+        // Handle Cloudflare credentials sync (not a WatchMessage, uses a raw dictionary)
+        if dictionary["_cfConfig"] as? Bool == true {
+            if let id = dictionary["cf_client_id"] as? String,
+               let secret = dictionary["cf_client_secret"] as? String {
+                UserDefaults.standard.set(id, forKey: "cf_client_id")
+                UserDefaults.standard.set(secret, forKey: "cf_client_secret")
+                print("[WatchSessionManager] Cloudflare credentials synced from companion")
+            }
+            return
+        }
+
         do {
             let message = try WatchMessage(from: dictionary)
 

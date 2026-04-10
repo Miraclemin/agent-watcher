@@ -11,6 +11,22 @@ struct ApprovalView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
+                // Read-only banner for external (non-tmux) terminals
+                if request.readOnly {
+                    HStack(spacing: 4) {
+                        Image(systemName: "eye.slash")
+                            .font(.system(size: 10))
+                        Text("Read-only — respond in Mac terminal")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+
                 // Question text
                 if let question = request.question {
                     Text(question)

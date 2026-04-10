@@ -21,10 +21,26 @@ struct SessionView: View {
                 // Top bar — agent icon + folder name
                 HStack(spacing: 4) {
                     AgentIcon(agent: agentSession.agent, size: 14)
-                    Text(agentSession.folderName.isEmpty ? agentSession.agent.rawValue.capitalized : agentSession.folderName)
+                    Text(agentSession.displayName)
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(Theme.Text.primary)
                         .lineLimit(1)
+                    Text(agentSession.sharedTerminal ? "SHR" : "RO")
+                        .font(.system(size: 8, weight: .black))
+                        .foregroundColor(agentSession.sharedTerminal ? Theme.Accent.success : Theme.Accent.approval)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background((agentSession.sharedTerminal ? Theme.Accent.success : Theme.Accent.approval).opacity(0.16))
+                        .clipShape(Capsule())
+                    if agentSession.activity == .waitingApproval || agentSession.pendingApproval != nil {
+                        Text("ASK")
+                            .font(.system(size: 8, weight: .black))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
+                            .background(Theme.Accent.approval)
+                            .clipShape(Capsule())
+                    }
                     Spacer()
                     Circle()
                         .fill(statusColor)
@@ -100,6 +116,7 @@ struct SessionView: View {
                     .shadow(color: .black.opacity(0.6), radius: 6, y: 3)
                 }
                 .buttonStyle(.plain)
+                .disabled(!micEnabled)
                 .padding(.trailing, 16)
             }
             .frame(maxHeight: .infinity, alignment: .bottom)
@@ -136,6 +153,17 @@ struct SessionView: View {
             return Theme.Accent.success
         }
         return colorFor(line.type)
+    }
+
+    private var micEnabled: Bool {
+        if agentSession.activity == .ended { return false }
+        // Allow mic for Codex inline approvals (user says 'y'/'n')
+        if agentSession.agent == .codex
+            && agentSession.activity == .waitingApproval
+            && agentSession.pendingApproval != nil {
+            return true
+        }
+        return agentSession.writable && agentSession.activity != .waitingApproval
     }
 
     private var isThinking: Bool {

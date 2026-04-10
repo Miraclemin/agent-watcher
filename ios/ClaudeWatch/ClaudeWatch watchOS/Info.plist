@@ -27,6 +27,6 @@
 	<key>WKApplication</key>
 	<true/>
 	<key>WKCompanionAppBundleIdentifier</key>
-	<string>com.shobhit.claudewatch</string>
+	<string>com.nightwatcherphone.han</string>
 </dict>
 </plist>

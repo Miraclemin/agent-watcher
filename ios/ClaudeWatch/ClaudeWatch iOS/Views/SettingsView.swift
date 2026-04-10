@@ -9,10 +9,16 @@ struct SettingsView: View {
 
     @State private var showForgetConfirmation = false
 
+    // Cloudflare Access credentials
+    @State private var cfClientId: String = UserDefaults.standard.string(forKey: "cf_client_id") ?? ""
+    @State private var cfClientSecret: String = UserDefaults.standard.string(forKey: "cf_client_secret") ?? ""
+    @State private var cfSaved: Bool = false
+
     var body: some View {
         NavigationStack {
             Form {
                 connectionSection
+                cloudflareSection
                 pairedMacSection
                 aboutSection
             }
@@ -30,6 +36,7 @@ struct SettingsView: View {
             }
             .alert("Forget Mac?", isPresented: $showForgetConfirmation) {
                 Button("Forget", role: .destructive) {
+                    relayService.clearPairingNotice()
                     relayService.unpair()
                     dismiss()
                 }
@@ -52,6 +59,43 @@ struct SettingsView: View {
             Text("Connection")
         } footer: {
             Text("Auto discovers the bridge via Bonjour on your local network.")
+        }
+    }
+
+    private var cloudflareSection: some View {
+        Section {
+            TextField("CF-Access-Client-Id", text: $cfClientId)
+                .font(.system(size: 14, design: .monospaced))
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            SecureField("CF-Access-Client-Secret", text: $cfClientSecret)
+                .font(.system(size: 14, design: .monospaced))
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            Button {
+                let id = cfClientId.trimmingCharacters(in: .whitespacesAndNewlines)
+                let secret = cfClientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+                UserDefaults.standard.set(id, forKey: "cf_client_id")
+                UserDefaults.standard.set(secret, forKey: "cf_client_secret")
+                WatchSessionManager.shared.syncCloudflareCredentials(clientId: id, clientSecret: secret)
+                cfSaved = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { cfSaved = false }
+            } label: {
+                HStack {
+                    Text(cfSaved ? "Saved & Synced to Watch" : "Save & Sync to Watch")
+                    Spacer()
+                    if cfSaved {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+            }
+        } header: {
+            Text("Cloudflare Access")
+        } footer: {
+            Text("For remote access via Cloudflare Tunnel. Leave blank for local network use. Get credentials from Zero Trust → Access → Service Auth.")
         }
     }
 
