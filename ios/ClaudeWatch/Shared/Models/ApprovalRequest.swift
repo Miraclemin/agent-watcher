@@ -3,6 +3,7 @@ import Foundation
 struct ApprovalRequest: Identifiable, Codable {
     let id: UUID
     let permissionId: String?
+    let sessionId: String?
     let toolName: String
     let actionSummary: String
     let timestamp: Date
@@ -32,9 +33,10 @@ struct ApprovalRequest: Identifiable, Codable {
         }
     }
 
-    init(permissionId: String? = nil, toolName: String, actionSummary: String, question: String? = nil, options: [OptionItem] = [], readOnly: Bool = false) {
+    init(permissionId: String? = nil, sessionId: String? = nil, toolName: String, actionSummary: String, question: String? = nil, options: [OptionItem] = [], readOnly: Bool = false) {
         self.id = UUID()
         self.permissionId = permissionId
+        self.sessionId = sessionId
         self.toolName = toolName
         self.actionSummary = actionSummary
         self.timestamp = Date()

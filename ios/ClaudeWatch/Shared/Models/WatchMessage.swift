@@ -23,23 +23,29 @@ enum WatchMessage: Codable {
     struct VoiceCommand: Codable {
         let id: UUID
         let transcribedText: String
+        let sessionId: String?
         let timestamp: Date
 
-        init(transcribedText: String) {
+        init(transcribedText: String, sessionId: String? = nil) {
             self.id = UUID()
             self.transcribedText = transcribedText
+            self.sessionId = sessionId
             self.timestamp = Date()
         }
     }
 
     struct ApprovalResponse: Codable {
-        let requestId: UUID
-        let approved: Bool
+        let permissionId: String
+        let optionLabel: String
+        let optionIndex: Int
+        let sessionId: String?
         let timestamp: Date
 
-        init(requestId: UUID, approved: Bool) {
-            self.requestId = requestId
-            self.approved = approved
+        init(permissionId: String, optionLabel: String, optionIndex: Int, sessionId: String? = nil) {
+            self.permissionId = permissionId
+            self.optionLabel = optionLabel
+            self.optionIndex = optionIndex
+            self.sessionId = sessionId
             self.timestamp = Date()
         }
     }

@@ -86,7 +86,9 @@ const PORT_RANGE_END = 7869;
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
-const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
+const SSE_HEARTBEAT_INTERVAL_MS = 2_000;
+const SSE_MIN_CHUNK_BYTES = 1024;
+const SSE_PRELUDE_PADDING_BYTES = 2048;
 const SSE_BUFFER_SIZE = 500;
 const SESSION_REPLAY_BUFFER_SIZE = 1000;
 const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
@@ -117,7 +119,7 @@ const BRIDGE_ID = crypto.randomUUID();
 // State
 // ---------------------------------------------------------------------------
 
-let sessionToken = null;
+const sessionTokens = new Set();
 let pairingCode = null;
 let pairingCodeExpiresAt = 0;
 
@@ -171,6 +173,9 @@ const externalSessionAliases = new Map();
 const codexSyntheticPermissions = new Map();
 /** @type {Map<string, string>} */
 const codexSyntheticPermissionBySession = new Map();
+/** Track recently resolved approval sessions so the log-file path doesn't re-surface them */
+const codexRecentlyResolvedApprovals = new Map(); // sessionId → timestamp
+const CODEX_RESOLVED_APPROVAL_TTL_MS = 60_000; // 60 seconds
 const codexLogState = { offset: 0, remainder: "", initialized: false };
 let codexMonitorInterval = null;
 let claudeMonitorInterval = null;
@@ -197,7 +202,7 @@ function generatePairingCode() {
 
 function generateSessionToken() {
   const token = crypto.randomBytes(32).toString("hex");
-  sessionToken = token;
+  sessionTokens.add(token);
   return token;
 }
 
@@ -223,7 +228,7 @@ function requireAuth(req) {
   const auth = req.headers["authorization"];
   if (!auth || !auth.startsWith("Bearer ")) return false;
   const token = auth.slice(7);
-  return token === sessionToken && sessionToken !== null;
+  return sessionTokens.has(token);
 }
 
 function jsonResponse(res, status, body) {
@@ -450,6 +455,50 @@ function getProcessCwd(pid) {
   return null;
 }
 
+function parseCodexSessionIdFromPath(filePath) {
+  const normalized = String(filePath || "").trim();
+  if (!normalized || !normalized.endsWith(".jsonl")) return null;
+  if (!normalized.startsWith(`${CODEX_SESSION_ROOT}${path.sep}`)) return null;
+
+  const match = normalized.match(/([0-9a-f-]{36})\.jsonl$/i);
+  return match ? match[1] : null;
+}
+
+function getCodexSessionIdForPid(pid) {
+  if (!LSOF_BIN || !Number.isFinite(pid) || pid <= 0) return null;
+
+  const result = childSpawnSync(LSOF_BIN, ["-a", "-p", String(pid), "-Fn"], {
+    encoding: "utf-8",
+    env: { ...process.env },
+  });
+  if (result.status !== 0) return null;
+
+  const sessionIds = new Set();
+  for (const line of (result.stdout || "").split("\n")) {
+    if (!line.startsWith("n") || line.length <= 1) continue;
+    const sessionId = parseCodexSessionIdFromPath(line.slice(1));
+    if (sessionId) {
+      sessionIds.add(sessionId);
+    }
+  }
+
+  if (sessionIds.size !== 1) return null;
+  return [...sessionIds][0];
+}
+
+function findCodexSessionIdForProcessBucket(processes = []) {
+  const sessionIds = new Set();
+  for (const proc of processes) {
+    const sessionId = getCodexSessionIdForPid(proc?.pid);
+    if (sessionId) {
+      sessionIds.add(sessionId);
+    }
+  }
+
+  if (sessionIds.size !== 1) return null;
+  return [...sessionIds][0];
+}
+
 
 function listLiveAgentProcesses() {
   if (!PS_BIN) return [];
@@ -498,7 +547,11 @@ function listLiveAgentProcesses() {
       if (scoreDiff !== 0) return scoreDiff;
       return (rhs.startedAt || 0) - (lhs.startedAt || 0);
     });
-    selected.push(bucket[0]);
+    const selectedProc = { ...bucket[0] };
+    if (selectedProc.agent === "codex") {
+      selectedProc.exactSessionId = findCodexSessionIdForProcessBucket(bucket);
+    }
+    selected.push(selectedProc);
   }
 
   // Resolve cwd for selected processes
@@ -535,34 +588,133 @@ function findMatchingLiveAgentProcess(agent, cwd = null, hints = {}) {
   }
 
   if (hints.tty) {
-    const exactTty = matches.find((proc) => proc.tty === hints.tty);
+    const normalizedTty = normalizeTty(hints.tty);
+    const exactTty = matches.find((proc) => normalizeTty(proc.tty) === normalizedTty);
     if (exactTty) return exactTty;
   }
 
   if (cwd) {
-    const exactCwd = matches
-      .filter((proc) => proc.cwd === cwd)
-      .sort((lhs, rhs) => (rhs.startedAt || 0) - (lhs.startedAt || 0));
-    if (exactCwd.length > 0) return exactCwd[0];
+    const exactCwdMatches = matches.filter((proc) => proc.cwd === cwd);
+    if (exactCwdMatches.length === 1) {
+      return exactCwdMatches[0];
+    }
   }
 
-  return matches.length === 1 ? matches[0] : null;
+  return null;
+}
+
+function findExactLiveAgentProcess(agent, stableExternalSessionId, cwd = null) {
+  if (!stableExternalSessionId) return null;
+
+  const matches = Array.from(liveAgentProcesses.values()).filter((proc) => {
+    if (proc.agent !== agent) return false;
+    if (proc.exactSessionId !== stableExternalSessionId) return false;
+    if (cwd && proc.cwd && proc.cwd !== cwd) return false;
+    return true;
+  });
+
+  if (matches.length !== 1) return null;
+  return matches[0];
+}
+
+function findTimeCompatibleLiveAgentProcess(agent, cwd = null, externalCreatedAt = null) {
+  if (!Number.isFinite(externalCreatedAt)) return null;
+
+  const matches = Array.from(liveAgentProcesses.values()).filter((proc) => {
+    if (proc.agent !== agent) return false;
+    if (!isSessionTimingCompatible(proc.startedAt, externalCreatedAt)) return false;
+    if (cwd && proc.cwd && proc.cwd !== cwd) return false;
+    return true;
+  });
+
+  if (matches.length !== 1) return null;
+  return matches[0];
+}
+
+function sessionOwnershipScore(slot) {
+  let score = 0;
+  if (!slot) return score;
+  if (slot.managedDesktop === true && slot.attachedTmuxPane !== true) score += 100;
+  if (!isSyntheticExternalSessionId(slot.id)) score += 30;
+  if (slot.attachedTmuxPane !== true) score += 20;
+  if (slot.managedDesktop === true) score += 10;
+  if (slot.externalSessionId && !isSyntheticExternalSessionId(slot.externalSessionId)) score += 5;
+  return score;
+}
+
+function compareSessionOwnershipPreference(lhs, rhs) {
+  const scoreDiff = sessionOwnershipScore(rhs) - sessionOwnershipScore(lhs);
+  if (scoreDiff !== 0) return scoreDiff;
+  return getSessionActivityTimestamp(rhs) - getSessionActivityTimestamp(lhs);
 }
 
 function findSessionForLiveProcess(proc) {
   if (!proc) return null;
   const procTty = normalizeTty(proc.tty);
+  const matches = [];
 
   for (const [, slot] of sessions) {
     if (slot.state !== "running") continue;
     if (slot.agent !== proc.agent) continue;
-    if (slot.externalProcessPid && slot.externalProcessPid === proc.pid) return slot;
-    if (normalizeTty(slot.externalTty) && normalizeTty(slot.externalTty) === procTty) return slot;
-    if (slot.tmuxPanePid && slot.tmuxPanePid === proc.pid) return slot;
-    if (normalizeTty(slot.tmuxPaneTty) && normalizeTty(slot.tmuxPaneTty) === procTty) return slot;
+    if (slot.externalProcessPid && slot.externalProcessPid === proc.pid) {
+      matches.push(slot);
+      continue;
+    }
+    if (normalizeTty(slot.externalTty) && normalizeTty(slot.externalTty) === procTty) {
+      matches.push(slot);
+      continue;
+    }
+    if (slot.tmuxPanePid && slot.tmuxPanePid === proc.pid) {
+      matches.push(slot);
+      continue;
+    }
+    if (normalizeTty(slot.tmuxPaneTty) && normalizeTty(slot.tmuxPaneTty) === procTty) {
+      matches.push(slot);
+    }
   }
 
-  return null;
+  matches.sort(compareSessionOwnershipPreference);
+  return matches[0] || null;
+}
+
+function dedupeSessionsByTmuxPane() {
+  const grouped = new Map();
+
+  for (const slot of sessions.values()) {
+    if (slot.state !== "running") continue;
+    const paneTarget = getTmuxPaneTarget(slot);
+    if (!paneTarget) continue;
+    const bucket = grouped.get(paneTarget) || [];
+    bucket.push(slot);
+    grouped.set(paneTarget, bucket);
+  }
+
+  for (const [paneTarget, bucket] of grouped.entries()) {
+    if (bucket.length <= 1) continue;
+    bucket.sort(compareSessionOwnershipPreference);
+    const keeper = bucket[0];
+
+    for (const duplicate of bucket.slice(1)) {
+      log("info", `Removing duplicate session ${duplicate.id} — same tmux pane ${paneTarget} as ${keeper.id}`);
+      duplicate.state = "removed";
+      duplicate.ptyProcess = null;
+      queuedPrompts.delete(duplicate.id);
+      claudeSessionFiles.delete(duplicate.id);
+      unregisterTmuxLogFile(duplicate);
+      sessionReplayBuffers.delete(duplicate.id);
+      clearCodexSyntheticPermissionForSession(duplicate.id, "duplicate-pane");
+      cleanupTmuxFiles(duplicate);
+
+      for (const [alias, target] of externalSessionAliases.entries()) {
+        if (target === duplicate.id || alias === duplicate.externalSessionId) {
+          externalSessionAliases.delete(alias);
+        }
+      }
+
+      sessions.delete(duplicate.id);
+      pushSseEvent("session-removed", { agent: duplicate.agent, folderName: duplicate.folderName, reason: "duplicate-pane" }, duplicate.id);
+    }
+  }
 }
 
 function reconcileExternalSessionsWithLiveProcesses() {
@@ -620,9 +772,16 @@ function reconcileExternalSessionsWithLiveProcesses() {
   for (const proc of liveAgentProcesses.values()) {
     if (findSessionForLiveProcess(proc)) continue;
     const resolvedCwd = proc.cwd || process.env.HOME || process.cwd();
-    const record = findRecentExternalSessionRecord(proc.agent, resolvedCwd);
+    const stableExternalSessionId = proc.agent === "codex"
+      ? proc.exactSessionId || null
+      : null;
+    const record = stableExternalSessionId
+      ? findRecentExternalSessionRecord(proc.agent, resolvedCwd, stableExternalSessionId)
+      : findRecentExternalSessionRecord(proc.agent, resolvedCwd);
     const knownSessionIds = new Set(sessions.keys());
-    const discoveredSessionId = `external-${proc.agent}-${proc.pid}`;
+    const discoveredSessionId = stableExternalSessionId
+      || (proc.agent === "claude" ? record?.sessionId || null : null)
+      || `external-${proc.agent}-${proc.pid}`;
     const slot = touchExternalSession(
       discoveredSessionId,
       resolvedCwd,
@@ -651,6 +810,8 @@ function reconcileExternalSessionsWithLiveProcesses() {
       }
     }
   }
+
+  dedupeSessionsByTmuxPane();
 }
 
 function ensureTmuxLogRoot() {
@@ -1215,6 +1376,7 @@ function stopTmuxMonitor() {
 
 function recoverTmuxSessions() {
   if (!TMUX_BIN || !ensureTmuxLogRoot()) return;
+  refreshLiveAgentProcesses(true);
 
   let entries = [];
   try {
@@ -1255,6 +1417,10 @@ function recoverTmuxSessions() {
       resumeSessionId: parsed.resumeSessionId
         || (parsed.externalSessionId && parsed.externalSessionId !== parsed.id ? parsed.externalSessionId : null)
         || null,
+      externalProcessPid: parsed.attachedTmuxPane === true && Number.isFinite(parsed.tmuxPanePid)
+        ? parsed.tmuxPanePid
+        : null,
+      externalTty: parsed.attachedTmuxPane === true ? parsed.tmuxPaneTty || null : null,
       tmuxSessionName: parsed.tmuxSessionName,
       tmuxPaneTarget: parsed.tmuxPaneTarget || `${parsed.tmuxSessionName}:0.0`,
       tmuxPanePid: Number.isFinite(parsed.tmuxPanePid) ? parsed.tmuxPanePid : null,
@@ -1267,6 +1433,34 @@ function recoverTmuxSessions() {
 
     sessions.set(slot.id, slot);
     refreshTmuxPaneIdentity(slot);
+    const liveProcess = findMatchingLiveAgentProcess(slot.agent, slot.cwd, {
+      pid: slot.tmuxPanePid,
+      tty: slot.tmuxPaneTty,
+    });
+    if (slot.attachedTmuxPane === true && !liveProcess) {
+      sessions.delete(slot.id);
+      try { fs.unlinkSync(metaFile); } catch { /* ignore */ }
+      log("info", `Skipped stale recovered tmux mirror ${slot.id} (${slot.agent}) — no matching live process on ${slot.tmuxPaneTty || slot.tmuxPaneTarget}`);
+      continue;
+    }
+    if (liveProcess) {
+      slot.externalProcessPid = liveProcess.pid;
+      slot.externalTty = liveProcess.tty;
+      if (slot.agent === "codex" && liveProcess.exactSessionId) {
+        slot.externalSessionId = liveProcess.exactSessionId;
+        slot.resumeSessionId = liveProcess.exactSessionId;
+      }
+    }
+    if (
+      slot.agent === "claude"
+      && (!slot.externalSessionId || isSyntheticExternalSessionId(slot.externalSessionId))
+    ) {
+      const record = findRecentClaudeSessionRecord(slot.cwd);
+      if (record?.sessionId) {
+        slot.externalSessionId = record.sessionId;
+        slot.resumeSessionId = record.sessionId;
+      }
+    }
     registerTmuxLogFile(slot);
     ensureSessionMonitoring(slot);
     pushSseEvent("session", { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }, slot.id);
@@ -1278,6 +1472,8 @@ function recoverTmuxSessions() {
     }
     log("info", `Recovered tmux session ${slot.id} (${slot.agent})`);
   }
+
+  dedupeSessionsByTmuxPane();
 }
 
 function pruneDesktopLaunchRecords() {
@@ -1300,15 +1496,27 @@ function isSyntheticExternalSessionId(sessionId) {
 
 function registerExternalSessionAliases(slot, ...aliases) {
   if (!slot?.id) return;
-  for (const alias of aliases) {
-    if (!alias || alias === slot.id) continue;
+
+  const desiredAliases = new Set(
+    [slot.externalSessionId, slot.resumeSessionId, ...aliases]
+      .filter((alias) => alias && alias !== slot.id)
+  );
+
+  for (const [alias, target] of externalSessionAliases.entries()) {
+    if (target !== slot.id) continue;
+    if (!desiredAliases.has(alias)) {
+      externalSessionAliases.delete(alias);
+    }
+  }
+
+  for (const alias of desiredAliases) {
     externalSessionAliases.set(alias, slot.id);
   }
 }
 
 function isSessionTimingCompatible(slotCreatedAt, externalCreatedAt) {
   if (!Number.isFinite(slotCreatedAt) || !Number.isFinite(externalCreatedAt)) return true;
-  return slotCreatedAt <= externalCreatedAt + SESSION_MATCH_TIME_SKEW_MS;
+  return Math.abs(slotCreatedAt - externalCreatedAt) <= SESSION_MATCH_TIME_SKEW_MS;
 }
 
 function listRecentClaudeSessionFiles(cwd) {
@@ -1705,11 +1913,8 @@ function pushSseEvent(event, data, sessionId = null) {
   sseBuffer.push(entry);
 
   // Broadcast to connected clients
-  const formatted = formatSseMessage(entry);
   for (const client of sseClients) {
-    try {
-      client.write(formatted);
-    } catch {
+    if (!writeSseEvent(client, entry)) {
       sseClients.delete(client);
     }
   }
@@ -1723,6 +1928,37 @@ function formatSseMessage(entry) {
   }
   msg += "\n";
   return msg;
+}
+
+function padSseChunk(chunk, minBytes = SSE_MIN_CHUNK_BYTES) {
+  const currentBytes = Buffer.byteLength(chunk);
+  if (currentBytes >= minBytes) return chunk;
+
+  const paddingBytes = Math.max(0, minBytes - currentBytes - 4);
+  return `${chunk}:${" ".repeat(paddingBytes)}\n\n`;
+}
+
+function writeSseRaw(res, chunk) {
+  if (!res || res.writableEnded || res.destroyed) return false;
+  try {
+    res.write(chunk);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeSsePrelude(res) {
+  const padding = " ".repeat(SSE_PRELUDE_PADDING_BYTES);
+  return writeSseRaw(res, `: connected ${padding}\n\n`);
+}
+
+function writeSseEvent(res, entry) {
+  return writeSseRaw(res, padSseChunk(formatSseMessage(entry)));
+}
+
+function writeSseHeartbeat(res) {
+  return writeSseRaw(res, padSseChunk(`:heartbeat ${Date.now()}\n\n`));
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,42 +2178,6 @@ function findManagedSlotForExternalSession(agent, cwd, actualSessionId = null, e
   if (canonicalSessionId && sessions.has(canonicalSessionId)) {
     return sessions.get(canonicalSessionId);
   }
-
-  let best = null;
-  for (const [, slot] of sessions) {
-    if (slot.state !== "running") continue;
-    if (slot.agent !== agent) continue;
-    if (slot.cwd !== cwd) continue;
-    if (actualSessionId && slot.externalSessionId && slot.externalSessionId !== actualSessionId) continue;
-    if (slot.managedDesktop !== true) continue;
-    if (!isSessionTimingCompatible(slot.createdAt || 0, externalCreatedAt)) continue;
-    if (!best) {
-      best = slot;
-      continue;
-    }
-    if (Number.isFinite(externalCreatedAt)) {
-      const slotDelta = Math.abs((slot.createdAt || 0) - externalCreatedAt);
-      const bestDelta = Math.abs((best.createdAt || 0) - externalCreatedAt);
-      if (slotDelta < bestDelta || (slotDelta === bestDelta && (slot.createdAt || 0) > (best.createdAt || 0))) {
-        best = slot;
-      }
-      continue;
-    }
-    if ((slot.createdAt || 0) > (best.createdAt || 0)) {
-      best = slot;
-    }
-  }
-
-  if (best && actualSessionId) {
-    best.externalSessionId = actualSessionId;
-    best.resumeSessionId = actualSessionId;
-    registerExternalSessionAliases(best, actualSessionId);
-    persistTmuxSessionMetadata(best);
-    log("info", `Matched managed desktop ${agent} slot ${best.id} to external session ${actualSessionId}`);
-  }
-
-  if (best) return best;
-
   return null;
 }
 
@@ -2136,24 +2336,18 @@ function findAliasCandidateForStableExternalSession(agent, cwd, stableExternalSe
     return null;
   }
 
-  const matches = [];
   for (const [, slot] of sessions) {
     if (slot.state !== "running") continue;
-    if (slot.cwd !== cwd) continue;
     if (slot.agent !== agent) continue;
-    if (!hasInteractiveBackend(slot)) continue;
-    if (Date.now() - getSessionActivityTimestamp(slot) > RECENT_SESSION_ACTIVITY_WINDOW_MS) continue;
-
-    if (slot.id === stableExternalSessionId || slot.externalSessionId === stableExternalSessionId) {
+    if (
+      slot.id === stableExternalSessionId
+      || slot.externalSessionId === stableExternalSessionId
+      || slot.resumeSessionId === stableExternalSessionId
+    ) {
       return slot;
     }
-
-    if (!slot.externalSessionId || isSyntheticExternalSessionId(slot.externalSessionId)) {
-      matches.push(slot);
-    }
   }
-
-  return matches.length === 1 ? matches[0] : null;
+  return null;
 }
 
 function findMostRecentActiveSession(agent = null) {
@@ -2181,9 +2375,91 @@ function findMostRecentRunningSession() {
   return best;
 }
 
+function inferRecentLineType(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "output";
+  if (trimmed.startsWith("> ") || trimmed.startsWith("$ ")) return "command";
+  if (
+    trimmed.startsWith("[queued prompt]")
+    || trimmed.startsWith("[launching]")
+    || trimmed.startsWith("Task completed")
+    || trimmed.startsWith("Session stopped")
+  ) {
+    return "system";
+  }
+  if (trimmed.startsWith("Error:") || trimmed.startsWith("ERR ")) {
+    return "error";
+  }
+  return "output";
+}
+
+function buildRecentTerminalLines(slot) {
+  const bootstrapText = slot?.backend === "tmux" ? getTmuxBootstrapText(slot) : "";
+  if (bootstrapText) {
+    const baseTs = Date.now();
+    return bootstrapText
+      .split("\n")
+      .map((line) => line.trimEnd())
+      .filter((line) => line.trim().length > 0)
+      .slice(-40)
+      .map((line, index, arr) => ({
+        text: line,
+        type: inferRecentLineType(line),
+        timestamp: (baseTs - ((arr.length - index) * 250)) / 1000,
+      }));
+  }
+
+  const replay = getSessionReplayEntries(slot?.id).slice(-30);
+  const baseTs = Date.now();
+  const lines = [];
+
+  for (const entry of replay) {
+    const data = entry.data || {};
+    if (entry.event === "conversation-message") {
+      const text = String(data.text || "").trim();
+      if (!text) continue;
+      lines.push({
+        text: data.role === "user" ? `> ${text}` : text,
+        type: data.role === "user" ? "command" : "output",
+        timestamp: baseTs / 1000,
+      });
+      continue;
+    }
+
+    if (entry.event === "pty-output") {
+      const text = String(data.text || "");
+      for (const line of text.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        lines.push({
+          text: trimmed,
+          type: inferRecentLineType(trimmed),
+          timestamp: baseTs / 1000,
+        });
+      }
+      continue;
+    }
+
+    if (entry.event === "error") {
+      const message = String(data.error || data.message || "").trim();
+      if (!message) continue;
+      lines.push({
+        text: message,
+        type: "error",
+        timestamp: baseTs / 1000,
+      });
+    }
+  }
+
+  return lines.slice(-40);
+}
+
 function getSessionsSnapshot(options = {}) {
   const includeRecentEvents = options.includeRecentEvents === true;
-  return getSortedSessions().map((s) => ({
+  const includeRecentLines = options.includeRecentLines === true;
+  return getSortedSessions()
+    .filter((s) => s.state !== "ended" && s.state !== "removed")
+    .map((s) => ({
     id: s.id,
     agent: s.agent,
     cwd: s.cwd,
@@ -2199,7 +2475,8 @@ function getSessionsSnapshot(options = {}) {
     createdAt: s.createdAt,
     lastActivityAt: s.lastActivityAt || null,
     ...(includeRecentEvents ? { recentEvents: getSessionReplayEntries(s.id) } : {}),
-  }));
+    ...(includeRecentLines ? { recentLines: buildRecentTerminalLines(s) } : {}),
+    }));
 }
 
 function safeStat(targetPath) {
@@ -2404,19 +2681,39 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
   const actualSessionId = resumeSessionId || sessionId || crypto.randomUUID();
   const stableExternalSessionId = isSyntheticExternalSessionId(actualSessionId) ? null : actualSessionId;
   const effectiveCreatedAt = createdAt || extra.createdAt || Date.now();
-  const managedSlot = findManagedSlotForExternalSession(agent, resolvedCwd, stableExternalSessionId, effectiveCreatedAt);
   const hasProcessHints = Number.isFinite(extra.externalProcessPid) || Boolean(extra.externalTty);
+  const shouldCheckLiveProcesses = hasProcessHints
+    || agent !== "codex"
+    || isSyntheticExternalSessionId(sessionId)
+    || isSyntheticExternalSessionId(actualSessionId)
+    || Number.isFinite(effectiveCreatedAt);
+  if (shouldCheckLiveProcesses) {
+    refreshLiveAgentProcesses();
+  }
+
+  const exactLiveProcess = stableExternalSessionId
+    ? findExactLiveAgentProcess(agent, stableExternalSessionId, resolvedCwd)
+    : null;
+  const timeMatchedLiveProcess = !hasProcessHints
+    && !exactLiveProcess
+    ? findTimeCompatibleLiveAgentProcess(agent, resolvedCwd, effectiveCreatedAt)
+    : null;
+  const managedSlot = !exactLiveProcess && !timeMatchedLiveProcess && stableExternalSessionId
+    ? findManagedSlotForExternalSession(agent, resolvedCwd, stableExternalSessionId, effectiveCreatedAt)
+    : null;
   const shouldMatchLiveProcess = !managedSlot && (
     hasProcessHints
+    || Boolean(exactLiveProcess)
+    || Boolean(timeMatchedLiveProcess)
     || agent !== "codex"
     || isSyntheticExternalSessionId(sessionId)
     || isSyntheticExternalSessionId(actualSessionId)
   );
   const liveProcess = shouldMatchLiveProcess
-    ? findMatchingLiveAgentProcess(agent, resolvedCwd, {
+    ? (exactLiveProcess || timeMatchedLiveProcess || findMatchingLiveAgentProcess(agent, resolvedCwd, {
       pid: extra.externalProcessPid,
       tty: extra.externalTty,
-    })
+    }))
     : null;
   const matchedTmuxPane = extra.matchedTmuxPane || findTmuxPaneForTty(liveProcess?.tty || extra.externalTty);
   const existingLiveSlot = liveProcess ? findSessionForLiveProcess(liveProcess) : null;
@@ -2440,7 +2737,21 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
     || getCanonicalSessionId(actualSessionId)
     || getCanonicalSessionId(sessionId)
     || actualSessionId;
-  const existing = sessions.get(canonicalSessionId) || existingLiveSlot || aliasCandidate;
+  // Also match by tmux pane: if another session already owns the same pane,
+  // reuse it instead of creating a duplicate (e.g. Codex process restart in the same pane).
+  const existingByTmuxPane = !managedSlot && !existingLiveSlot && !aliasCandidate && matchedTmuxPane
+    ? [...sessions.values()]
+        .filter(s =>
+          s.state === "running"
+          && s.agent === agent
+          && getTmuxPaneTarget(s) === (matchedTmuxPane.paneTarget || matchedTmuxPane.paneId)
+        )
+        .sort(compareSessionOwnershipPreference)[0]
+    : null;
+  if (existingByTmuxPane) {
+    log("info", `Matched ${agent} session by tmux pane ${getTmuxPaneTarget(existingByTmuxPane)} (existing ${existingByTmuxPane.id}, incoming ${stableExternalSessionId || sessionId})`);
+  }
+  const existing = sessions.get(canonicalSessionId) || existingLiveSlot || aliasCandidate || existingByTmuxPane;
 
   if (!existing && agent === "codex" && !managedSlot && !liveProcess && !matchedTmuxPane && extra.allowDetachedCreate !== true) {
     log("info", `Skipped detached codex session ${stableExternalSessionId || actualSessionId || sessionId} (${folderName}) from file-only detection`);
@@ -2455,7 +2766,7 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
     existing.cwd = resolvedCwd;
     existing.folderName = folderName;
     existing.state = "running";
-    existing.createdAt = effectiveCreatedAt || existing.createdAt || Date.now();
+    existing.createdAt = existing.createdAt || effectiveCreatedAt || Date.now();
     existing.lastActivityAt = Date.now();
     existing.managedDesktop = existing.managedDesktop || Boolean(managedSlot);
     existing.pidFile = existing.pidFile || managedSlot?.pidFile || null;
@@ -2481,6 +2792,17 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
       });
     }
     persistTmuxSessionMetadata(existing);
+    // Clean up any other sessions that point to the same tmux pane (stale duplicates).
+    const currentPaneTarget = getTmuxPaneTarget(existing);
+    if (currentPaneTarget) {
+      for (const [otherId, other] of sessions) {
+        if (otherId !== existing.id && other.state === "running" && getTmuxPaneTarget(other) === currentPaneTarget) {
+          log("info", `Ending duplicate session ${otherId} — same tmux pane ${currentPaneTarget} as ${existing.id}`);
+          other.state = "ended";
+          pushSseEvent("session", { state: "ended", agent: other.agent, folderName: other.folderName, reason: "duplicate-pane" }, otherId);
+        }
+      }
+    }
     if (wasEnded) {
       pushSseEvent("session", { state: "running", agent, cwd: resolvedCwd, folderName }, existing.id);
       log("info", `Revived ${agent} session ${existing.id} (${folderName}) from local session data`);
@@ -2521,6 +2843,17 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
     });
   }
   persistTmuxSessionMetadata(slot);
+  // Clean up any other sessions that point to the same tmux pane (stale duplicates).
+  const newPaneTarget = getTmuxPaneTarget(slot);
+  if (newPaneTarget) {
+    for (const [otherId, other] of sessions) {
+      if (otherId !== slot.id && other.state === "running" && getTmuxPaneTarget(other) === newPaneTarget) {
+        log("info", `Ending duplicate session ${otherId} — same tmux pane ${newPaneTarget} as new session ${slot.id}`);
+        other.state = "ended";
+        pushSseEvent("session", { state: "ended", agent: other.agent, folderName: other.folderName, reason: "duplicate-pane" }, otherId);
+      }
+    }
+  }
   log("info", `Detected ${agent} session ${slot.id} (${folderName}) from local session data`);
   if (agent === "codex" && sessionId && codexOpenExecApprovals.has(sessionId)) {
     surfaceCodexExecApproval(sessionId);
@@ -2780,6 +3113,12 @@ function clearCodexSyntheticPermissionForSession(sessionId, reason = "cleared") 
     codexRecentExecCommands.delete(slot.externalSessionId);
     codexOpenExecApprovals.delete(slot.externalSessionId);
   }
+  // Remember this session was recently resolved so the log-file path
+  // (which may arrive late) doesn't re-surface the same approval.
+  codexRecentlyResolvedApprovals.set(sessionId, Date.now());
+  if (slot?.externalSessionId && slot.externalSessionId !== sessionId) {
+    codexRecentlyResolvedApprovals.set(slot.externalSessionId, Date.now());
+  }
   pushSseEvent("permission-cleared", { permissionId, reason }, resolvedSessionId);
   return true;
 }
@@ -2883,7 +3222,15 @@ function handleCodexJsonlLine(line, fileState, options = {}) {
       args: parsedArgs,
     });
     if (parsed.payload.name === "exec_command") {
-      recordCodexExecApprovalCandidateFromArgs(rawSessionId, parsedArgs);
+      const candidate = recordCodexExecApprovalCandidateFromArgs(rawSessionId, parsedArgs);
+      // Approach A: when JSONL reveals a require_escalated exec_command,
+      // surface the approval immediately instead of waiting for the log file
+      // (which may be buffered and only flushes on stdin activity).
+      if (candidate) {
+        codexOpenExecApprovals.add(rawSessionId);
+        const surfaced = surfaceCodexExecApproval(rawSessionId);
+        log("info", `[ApprovalTiming] JSONL detected require_escalated exec_command for ${rawSessionId}, surfaced=${surfaced}`);
+      }
     }
     return;
   }
@@ -3056,8 +3403,24 @@ function consumeCodexLogChunk(text) {
     if (approvalMatch) {
       const [, sessionId, state] = approvalMatch;
       if (state === "new") {
+        // Check if this approval was already surfaced (still pending) or recently resolved.
+        const alreadySurfacedViaJsonl = codexSyntheticPermissionBySession.has(getCanonicalSessionId(sessionId))
+          || [...sessions.values()].some(s => s.externalSessionId === sessionId && codexSyntheticPermissionBySession.has(s.id));
+        const recentlyResolved = codexRecentlyResolvedApprovals.has(sessionId);
+
+        if (alreadySurfacedViaJsonl) {
+          log("info", `[ApprovalTiming] Log file detected exec_approval for ${sessionId}, but ALREADY surfaced via JSONL (JSONL was faster ✓)`);
+        } else if (recentlyResolved) {
+          log("info", `[ApprovalTiming] Log file detected exec_approval for ${sessionId}, but already RESOLVED via JSONL — skipping re-surface`);
+        } else {
+          log("info", `[ApprovalTiming] Log file detected exec_approval for ${sessionId}, JSONL had NOT surfaced it (log was faster)`);
+        }
+
         codexOpenExecApprovals.add(sessionId);
-        surfaceCodexExecApproval(sessionId);
+        // Only surface if not already handled (pending or recently resolved) via JSONL.
+        if (!alreadySurfacedViaJsonl && !recentlyResolved) {
+          surfaceCodexExecApproval(sessionId);
+        }
       } else {
         // Codex can emit "close" before the UI visibly clears in the terminal.
         // Keep the mobile approval alive until actual task activity resumes.
@@ -3125,6 +3488,11 @@ function startCodexMonitor() {
     try {
       scanCodexSessionFiles();
       scanCodexLog();
+      // Purge stale entries from the recently-resolved set
+      const now = Date.now();
+      for (const [sid, ts] of codexRecentlyResolvedApprovals) {
+        if (now - ts > CODEX_RESOLVED_APPROVAL_TTL_MS) codexRecentlyResolvedApprovals.delete(sid);
+      }
     } catch (err) {
       log("warn", `Codex monitor scan failed: ${err.message}`);
     }
@@ -3438,7 +3806,7 @@ async function handlePair(req, res) {
   bridgeState = "connected";
   pushSseEvent("session", { state: "connected" });
 
-  log("info", "Watch paired successfully");
+  log("info", `Client paired successfully (active tokens: ${sessionTokens.size})`);
   return jsonResponse(res, 200, {
     token,
     bridgeId: BRIDGE_ID,
@@ -3678,17 +4046,25 @@ function handleEvents(req, res) {
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-store, must-revalidate, private, no-transform",
     Connection: "keep-alive",
+    "Content-Encoding": "identity",
     "X-Accel-Buffering": "no",
   });
+  res.flushHeaders?.();
+  res.socket?.setNoDelay?.(true);
+  res.socket?.setKeepAlive?.(true, 15_000);
+  writeSsePrelude(res);
+
   // Replay from Last-Event-ID if provided
   if (lastIdHeader && !shouldBootstrapFresh) {
     const lastId = parsedLastEventId;
     if (!isNaN(lastId)) {
       for (const entry of sseBuffer) {
         if (entry.id > lastId) {
-          res.write(formatSseMessage(entry));
+          if (!writeSseEvent(res, entry)) {
+            break;
+          }
         }
       }
     }
@@ -3699,7 +4075,12 @@ function handleEvents(req, res) {
 
   // Bootstrap fresh clients with the current session list plus recent per-session context.
   if (shouldBootstrapFresh) {
-    for (const slot of getSortedSessions()) {
+    const bootstrapSessions = getSortedSessions().filter(
+      (slot) => slot.state !== "ended" && slot.state !== "removed"
+    );
+    log("info", `SSE bootstrap: sending ${bootstrapSessions.length} live sessions`);
+
+    for (const slot of bootstrapSessions) {
       const syncEntry = formatSseMessage({
         id: sseEventId++,
         event: "session",
@@ -3708,7 +4089,7 @@ function handleEvents(req, res) {
           sessionId: slot.id,
         }),
       });
-      try { res.write(syncEntry); } catch { /* ignore */ }
+      writeSseRaw(res, padSseChunk(syncEntry));
 
       if (slot.backend === "tmux") {
         const bootstrapText = getTmuxBootstrapText(slot);
@@ -3722,12 +4103,12 @@ function handleEvents(req, res) {
               bootstrap: true,
             }),
           });
-          try { res.write(bootstrapEntry); } catch { /* ignore */ }
+          writeSseRaw(res, padSseChunk(bootstrapEntry));
         }
       }
     }
 
-    for (const slot of getSortedSessions()) {
+    for (const slot of bootstrapSessions) {
       for (const replayEntry of getSessionReplayEntries(slot.id)) {
         if (replayEntry.event === "session") continue;
         if (slot.backend === "tmux" && replayEntry.event === "pty-output") {
@@ -3739,7 +4120,7 @@ function handleEvents(req, res) {
           event: replayEntry.event,
           data: JSON.stringify(replayEntry.data),
         });
-        try { res.write(syncEntry); } catch { /* ignore */ }
+        writeSseRaw(res, padSseChunk(syncEntry));
       }
     }
   }
@@ -3754,13 +4135,11 @@ function handleEvents(req, res) {
         sessionId: synthetic.sessionId,
       }),
     });
-    try { res.write(syncEntry); } catch { /* ignore */ }
+    writeSseRaw(res, padSseChunk(syncEntry));
   }
 
   const heartbeat = setInterval(() => {
-    try {
-      res.write(":heartbeat\n\n");
-    } catch {
+    if (!writeSseHeartbeat(res)) {
       clearInterval(heartbeat);
       sseClients.delete(res);
     }
@@ -3822,23 +4201,6 @@ function resolveHookSession(body) {
       return promoted.id;
     }
   }
-
-  // Try exact cwd match first
-  const match = findSessionByCwd(cwd, agent);
-  if (match) return match.id;
-
-  const uniqueInteractiveMatch = findUniqueInteractiveSessionByCwd(resolvedCwd, agent, {
-    maxIdleMs: RECENT_SESSION_ACTIVITY_WINDOW_MS,
-  });
-  if (uniqueInteractiveMatch) {
-    log("info", `Resolved ${agent} hook without session id to unique interactive session ${uniqueInteractiveMatch.id} (${uniqueInteractiveMatch.folderName})`);
-    return uniqueInteractiveMatch.id;
-  }
-
-  // Fallback only when this agent has exactly one active interactive session.
-  const activeCandidates = getSortedSessions().filter((slot) => slot.agent === agent && hasInteractiveBackend(slot));
-  const active = activeCandidates.length === 1 ? activeCandidates[0] : null;
-  if (active) return active.id;
 
   // No session exists — auto-create one for this external Claude/Codex instance
   const sessionId = hookSessionId || crypto.randomUUID();
@@ -3983,13 +4345,65 @@ function handleStatus(_req, res) {
     sessionId: BRIDGE_ID, // backward compat
     state: bridgeState,
     availableAgents: availableAgentsList(),
-    sessions: getSessionsSnapshot(),
+    sessions: getSessionsSnapshot({ includeRecentLines: true }),
     sseClients: sseClients.size,
     pendingPermissions: pendingPermissions.size + codexSyntheticPermissions.size,
     eventBufferSize: sseBuffer.length,
     // Backward compat: expose the most recent active session's info
     hasPty: findMostRecentActiveSession() !== null,
     activeAgent: mostRecentRunningSession?.agent || null,
+  });
+}
+
+async function handleRegisterTerminal(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    return jsonResponse(res, 400, { error: "Invalid JSON" });
+  }
+
+  const source = body.source || body.agent || "claude";
+  const agent = source === "codex" ? "codex" : "claude";
+  const cwd = body.cwd || process.env.HOME || process.cwd();
+  const pid = Number(body.pid);
+  const tty = normalizeTty(body.tty);
+  const createdAt = Number(body.createdAt) || Date.now();
+
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return jsonResponse(res, 400, { error: "Missing or invalid pid" });
+  }
+
+  if (!tty) {
+    return jsonResponse(res, 400, { error: "Missing or invalid tty" });
+  }
+
+  const matchedPane = findTmuxPaneForTty(tty);
+  const syntheticSessionId = `external-${agent}-${pid}`;
+  const slot = touchExternalSession(syntheticSessionId, cwd, createdAt, agent, {
+    externalProcessPid: pid,
+    externalTty: tty,
+    matchedTmuxPane: matchedPane,
+    allowDetachedCreate: true,
+  }) || createExternalSession(syntheticSessionId, agent, cwd, createdAt, {
+    backend: matchedPane ? "tmux" : "external",
+    externalProcessPid: pid,
+    externalTty: tty,
+    tmuxSessionName: matchedPane?.sessionName || null,
+    tmuxPaneTarget: matchedPane?.paneTarget || null,
+    tmuxPanePid: matchedPane?.panePid || null,
+    tmuxPaneTty: matchedPane?.paneTty || null,
+    attachedTmuxPane: Boolean(matchedPane),
+  });
+
+  log("info", `Registered external ${agent} terminal pid=${pid} tty=${tty} -> session ${slot.id}`);
+  return jsonResponse(res, 200, {
+    ok: true,
+    sessionId: slot.id,
+    agent: slot.agent,
+    tmuxPaneTarget: getTmuxPaneTarget(slot),
   });
 }
 
@@ -4026,6 +4440,7 @@ const routes = {
   "POST /command": handleCommand,
   "POST /heartbeat": handleHeartbeat,
   "GET /events": handleEvents,
+  "POST /hooks/register-terminal": handleRegisterTerminal,
   "POST /hooks/tool-output": handleHookToolOutput,
   "POST /hooks/permission": handleHookPermission,
   "POST /hooks/stop": handleHookStop,
@@ -4096,7 +4511,7 @@ async function startServer() {
   // Bonjour
   bonjourInstance = new Bonjour();
   bonjourService = bonjourInstance.publish({
-    name: `Agent Watch Bridge (${os.hostname()})`,
+    name: `Agent Watcher Bridge (${os.hostname()})`,
     type: "claude-watch",
     protocol: "tcp",
     port: boundPort,

@@ -26,7 +26,7 @@ final class BonjourDiscovery: ObservableObject {
             case .timeout:
                 return "Discovery timed out after 5 seconds."
             case .noServiceFound:
-                return "No Agent Watch bridge found on your network."
+                return "No Agent Watcher bridge found on your network."
             case .permissionDenied:
                 return "Local network access was denied. Enable it in Settings > Privacy > Local Network."
             case .browsingFailed(let reason):

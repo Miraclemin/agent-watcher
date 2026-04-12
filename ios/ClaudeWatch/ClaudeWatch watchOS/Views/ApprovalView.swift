@@ -109,14 +109,7 @@ struct ApprovalView: View {
         let isLast = index == request.options.count - 1
         WKInterfaceDevice.current().play(isLast ? .failure : .success)
 
-        // For AskUserQuestion: send the option label
-        // For permission prompts: first = allow, last = deny
-        if request.question != nil {
-            session.respondToPermissionWithOption(option.label, index: index)
-        } else {
-            let approved = index != request.options.count - 1
-            session.respondToPermission(approved: approved)
-        }
+        session.respondToPermissionWithOption(option.label, index: index)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             dismiss()

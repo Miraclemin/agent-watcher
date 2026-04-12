@@ -1,11 +1,12 @@
 import SwiftUI
+import WatchKit
 
 struct SessionView: View {
     let sessionIndex: Int
     @EnvironmentObject private var session: WatchViewState
 
-    @State private var showVoiceInput = false
     @State private var cursorVisible = true
+    @State private var showVoiceInput = false
     private let cursorTimer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
 
     private var agentSession: AgentSession {
@@ -16,7 +17,7 @@ struct SessionView: View {
     }
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
                 // Top bar — agent icon + folder name
                 HStack(spacing: 4) {
@@ -66,7 +67,7 @@ struct SessionView: View {
                                     .id("cursor")
                             }
 
-                            Spacer().frame(height: 40)
+                            Spacer().frame(height: 46)
                         }
                         .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -82,51 +83,32 @@ struct SessionView: View {
                     }
                 }
             }
-            .background(Theme.Background.primary)
 
-            // FAB buttons
-            HStack {
-                // Clear button (left)
-                Button { session.clearTerminal(sessionId: agentSession.id) } label: {
-                    ZStack {
-                        Circle()
-                            .fill(Theme.Text.secondary.opacity(0.5))
-                            .frame(width: 28, height: 28)
-                        Image(systemName: "trash")
-                            .font(.system(size: 11))
-                            .foregroundColor(.white)
-                    }
-                    .shadow(color: .black.opacity(0.6), radius: 6, y: 3)
+            Button {
+                guard micEnabled else { return }
+                WKInterfaceDevice.current().play(.click)
+                showVoiceInput = true
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(micEnabled ? Theme.Text.primary.opacity(0.9) : Theme.Text.secondary.opacity(0.45))
+                        .frame(width: 44, height: 44)
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(.black.opacity(micEnabled ? 1 : 0.55))
                 }
-                .buttonStyle(.plain)
-                .padding(.leading, 16)
-
-                Spacer()
-
-                // Mic button (right)
-                Button { showVoiceInput = true } label: {
-                    ZStack {
-                        Circle()
-                            .fill(Theme.Text.primary.opacity(0.75))
-                            .frame(width: 28, height: 28)
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(.black)
-                    }
-                    .shadow(color: .black.opacity(0.6), radius: 6, y: 3)
-                }
-                .buttonStyle(.plain)
-                .disabled(!micEnabled)
-                .padding(.trailing, 16)
+                .contentShape(Circle())
+                .shadow(color: .black.opacity(0.45), radius: 6, y: 3)
             }
-            .frame(maxHeight: .infinity, alignment: .bottom)
-            .padding(.bottom, 16)
+            .buttonStyle(.plain)
+            .disabled(!micEnabled)
+            .padding(.bottom, 8)
         }
-        .ignoresSafeArea(edges: .bottom)
+        .background(Theme.Background.primary)
         .sheet(item: $session.pendingApproval) { request in
             ApprovalView(request: request)
         }
-        .fullScreenCover(isPresented: $showVoiceInput) {
+        .sheet(isPresented: $showVoiceInput) {
             VoiceInputView(sessionId: agentSession.id)
         }
     }
@@ -163,7 +145,7 @@ struct SessionView: View {
             && agentSession.pendingApproval != nil {
             return true
         }
-        return agentSession.writable && agentSession.activity != .waitingApproval
+        return agentSession.activity != .waitingApproval
     }
 
     private var isThinking: Bool {

@@ -15,10 +15,10 @@ struct TerminalLine: Identifiable, Codable, Equatable {
         case error       // Error messages
     }
 
-    init(text: String, type: LineType = .output, sessionId: String? = nil) {
-        self.id = UUID()
+    init(id: UUID = UUID(), text: String, timestamp: Date = Date(), type: LineType = .output, sessionId: String? = nil) {
+        self.id = id
         self.text = text
-        self.timestamp = Date()
+        self.timestamp = timestamp
         self.type = type
         self.sessionId = sessionId
     }

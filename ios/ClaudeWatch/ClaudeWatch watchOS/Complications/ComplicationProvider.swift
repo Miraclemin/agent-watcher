@@ -1,7 +1,7 @@
 import WidgetKit
 import SwiftUI
 
-// MARK: - Agent Watch Complication (WidgetKit)
+// MARK: - Agent Watcher Complication (WidgetKit)
 
 /// Timeline entry representing the current state of the Claude session.
 struct ClaudeWatchEntry: TimelineEntry {
@@ -129,7 +129,7 @@ struct ClaudeWatchComplication: Widget {
             ClaudeWatchRectangularView(entry: entry)
                 .containerBackground(Theme.Background.primary, for: .widget)
         }
-        .configurationDisplayName("Agent Watch")
+        .configurationDisplayName("Agent Watcher")
         .description("Shows Claude session status and latest output.")
         .supportedFamilies([.accessoryRectangular])
     }

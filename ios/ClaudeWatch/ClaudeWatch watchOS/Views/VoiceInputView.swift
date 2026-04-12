@@ -10,7 +10,6 @@ struct VoiceInputView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var commandText = ""
-    @State private var showError = false
     @State private var animationPhase: CGFloat = 0
     @FocusState private var isTextFieldFocused: Bool
 
@@ -38,9 +37,25 @@ struct VoiceInputView: View {
                     animationPhase += 1
                 }
 
-                // watchOS dictation-enabled TextField — tapping the mic icon
-                // on the keyboard triggers system dictation automatically.
-                TextField("Tap mic or type...", text: $commandText)
+                TextFieldLink(prompt: Text("Say your command")) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "mic.fill")
+                        Text("Dictate")
+                    }
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.black)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 44)
+                    .background(Theme.Text.primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                } onSubmit: { text in
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    commandText = trimmed
+                    sendCommand()
+                }
+
+                TextField("Or type here", text: $commandText)
                     .font(.system(size: 15, design: .monospaced))
                     .foregroundColor(Theme.Text.primary)
                     .textFieldStyle(.plain)
@@ -79,10 +94,6 @@ struct VoiceInputView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .onAppear {
-            // Auto-focus the text field to bring up keyboard/dictation
-            isTextFieldFocused = true
-        }
     }
 
     private func barHeight(for index: Int) -> CGFloat {
@@ -100,6 +111,7 @@ struct VoiceInputView: View {
         session.sendVoiceCommand(text, sessionId: sessionId)
         dismiss()
     }
+
 }
 
 // MARK: - Preview

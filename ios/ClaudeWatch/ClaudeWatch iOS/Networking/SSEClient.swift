@@ -22,9 +22,9 @@ final class SSEClient {
 
     // MARK: - Configuration
 
-    private let heartbeatTimeout: TimeInterval = 15.0
-    private let maxSSEFailures = 3
-    private let sseFailureWindow: TimeInterval = 30.0
+    private let heartbeatTimeout: TimeInterval = 45.0
+    private let maxSSEFailures = 6
+    private let sseFailureWindow: TimeInterval = 90.0
     private let pollingInterval: TimeInterval = 2.0
 
     // MARK: - Callbacks
@@ -66,10 +66,15 @@ final class SSEClient {
 
     // MARK: - Lifecycle
 
-    func connect(baseURL: URL, token: String) {
+    func connect(baseURL: URL, token: String, preferPolling: Bool = false) {
         self.baseURL = baseURL
         self.token = token
-        startSSE()
+        if preferPolling {
+            stopSSE()
+            startPolling()
+        } else {
+            startSSE()
+        }
     }
 
     func disconnect() {
@@ -103,6 +108,8 @@ final class SSEClient {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 0
         config.timeoutIntervalForResource = 0
+        config.waitsForConnectivity = true
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
 
         let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
         self.urlSession = session
@@ -168,7 +175,7 @@ final class SSEClient {
             startPolling()
         } else {
             // Reconnect SSE after a brief delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 self?.startSSE()
             }
         }

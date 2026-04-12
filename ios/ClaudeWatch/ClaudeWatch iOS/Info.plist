@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Agent Watch</string>
+	<string>Agent Watcher</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -25,11 +25,11 @@
 		<string>_claude-watch._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Agent Watch needs to find your Mac running the bridge server on your local network.</string>
+	<string>Agent Watcher needs to find your Mac running the bridge server on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Agent Watch needs microphone access so you can speak to the active terminal from your phone.</string>
+	<string>Agent Watcher needs microphone access so you can speak to the active terminal from your phone.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Agent Watch uses speech recognition to convert your iPhone voice input into terminal prompts.</string>
+	<string>Agent Watcher uses speech recognition to convert your iPhone voice input into terminal prompts.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

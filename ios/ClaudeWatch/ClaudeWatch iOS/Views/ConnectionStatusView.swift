@@ -115,7 +115,7 @@ struct ConnectionStatusView: View {
         HStack(spacing: 10) {
             AppLogo(size: 28)
 
-            Text("Agent Watch")
+            Text("Agent Watcher")
                 .font(.system(size: 17, weight: .bold))
                 .foregroundStyle(.white)
 
@@ -234,7 +234,8 @@ struct ConnectionStatusView: View {
 
     private var connectionBadgeTitle: String {
         switch relayService.connectionState {
-        case .connected: return "LAN"
+        case .connected:
+            return relayService.currentTransportMode == .remote ? "REMOTE" : "LAN"
         case .connecting: return "SYNC"
         case .disconnected: return "OFF"
         case .iPhoneUnreachable: return "PHONE"
@@ -700,7 +701,7 @@ private struct SessionPageView: View {
             }
 
             HStack(alignment: .bottom, spacing: 8) {
-                TextField(session.writable ? "Message Agent Watch" : "Read-only session", text: $promptText, axis: .vertical)
+                TextField(session.writable ? "Message Agent Watcher" : "Read-only session", text: $promptText, axis: .vertical)
                     .font(.system(size: 15, weight: .medium, design: .rounded))
                     .foregroundStyle(.white)
                     .tint(Color.claudeOrange)

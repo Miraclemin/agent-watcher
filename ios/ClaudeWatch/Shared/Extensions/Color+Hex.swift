@@ -32,7 +32,7 @@ extension Color {
         self.init(.sRGB, red: r, green: g, blue: b, opacity: a)
     }
 
-    // MARK: - Agent Watch brand colors
+    // MARK: - Agent Watcher brand colors
 
     /// Primary orange: #E87A35
     static let claudeOrange = Color(hex: "E87A35")

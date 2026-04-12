@@ -2,209 +2,58 @@ import SwiftUI
 
 struct OnboardingView: View {
     @EnvironmentObject private var session: WatchViewState
-    @StateObject private var bridge = WatchBridgeClient.shared
-
-    @State private var code = ""
-    @State private var ipAddress = ""
-    @State private var isSearching = false
-    @State private var isConnecting = false
-    @State private var error: String?
-    @State private var bridgeURL: URL?
-    @FocusState private var codeFocused: Bool
-    @FocusState private var ipFocused: Bool
+    @StateObject private var connectivity = WatchSessionManager.shared
 
     var body: some View {
-        VStack(spacing: 6) {
-            // Compact header — one line
-            HStack(spacing: 4) {
-                AppLogo(size: 22)
-                Text("Agent Watch")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(Theme.Text.primary)
+        VStack(spacing: 8) {
+            Spacer()
+
+            AppLogo(size: 24)
+
+            Text("Open iPhone App")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(Theme.Text.primary)
+
+            Text(statusText)
+                .font(.system(size: 11))
+                .foregroundColor(Theme.Text.secondary)
+                .multilineTextAlignment(.center)
+
+            Button {
+                session.requestCompanionSync()
+            } label: {
+                Text("Retry Sync")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.black)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 36)
+                    .background(Theme.Text.primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
             }
+            .buttonStyle(.plain)
 
-            if isSearching {
-                Spacer()
-                ProgressView()
-                    .tint(Theme.Text.secondary)
-                Text("Searching...")
-                    .font(.system(size: 11))
-                    .foregroundColor(Theme.Text.secondary)
-                Spacer()
-
-            } else if bridgeURL != nil {
-                // Bridge found — code entry
-                Text("Enter code from Mac")
-                    .font(.system(size: 11))
-                    .foregroundColor(Theme.Text.secondary)
-
-                TextField("000000", text: $code)
-                    .font(.system(size: 22, weight: .bold, design: .monospaced))
-                    .foregroundColor(Theme.Text.primary)
-                    .multilineTextAlignment(.center)
-                    .textContentType(.oneTimeCode)
-                    .focused($codeFocused)
-                    .onChange(of: code) { _, newValue in
-                        let filtered = String(newValue.filter { $0.isNumber }.prefix(6))
-                        if filtered != newValue { code = filtered }
-                        if filtered.count == 6 { submitCode(filtered) }
-                    }
-
-                if isConnecting {
-                    ProgressView()
-                        .tint(Theme.Text.primary)
-                        .scaleEffect(0.7)
-                }
-
-            } else {
-                // Not found — IP entry right away
-                Text("Enter Mac IP")
-                    .font(.system(size: 11))
-                    .foregroundColor(Theme.Text.secondary)
-
-                Text("IP address or Cloudflare URL")
-                    .font(.system(size: 9))
-                    .foregroundColor(Theme.Text.dimmed)
-
-                TextField("192.168.1.x or watch.x.com", text: $ipAddress)
-                    .font(.system(size: 16, weight: .bold, design: .monospaced))
-                    .foregroundColor(Theme.Text.primary)
-                    .multilineTextAlignment(.center)
-                    .focused($ipFocused)
-
-                Button { connectManual() } label: {
-                    Text("Connect")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.black)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 36)
-                        .background(Theme.Text.primary)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                .buttonStyle(.plain)
-                .disabled(ipAddress.isEmpty)
-
-                Button("Retry auto") { searchForBridge() }
-                    .font(.system(size: 10))
-                    .foregroundColor(Theme.Text.secondary)
-            }
-
-            if let error {
-                Text(error)
-                    .font(.system(size: 10))
-                    .foregroundColor(Theme.Accent.error)
-                    .lineLimit(2)
-            }
+            Spacer()
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Background.primary)
         .onAppear {
-            searchForBridge()
+            session.requestCompanionSync()
         }
     }
 
-    private func connectManual() {
-        let input = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !input.isEmpty else { return }
-        isSearching = true
-        error = nil
-
-        Task {
-            // Detect Cloudflare URL (contains letters) vs plain IP
-            let isCloudflareURL = input.contains(where: { $0.isLetter })
-
-            if isCloudflareURL {
-                var urlString = input
-                if !urlString.hasPrefix("http") { urlString = "https://" + urlString }
-                guard let url = URL(string: urlString) else {
-                    await MainActor.run { isSearching = false; error = "Invalid URL" }
-                    return
-                }
-                var request = URLRequest(url: url.appendingPathComponent("status"))
-                request.timeoutInterval = 5
-                request.addCloudflareAccessHeaders()
-                do {
-                    let (_, response) = try await URLSession.shared.data(for: request)
-                    if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                        await MainActor.run {
-                            isSearching = false
-                            bridgeURL = url
-                            codeFocused = true
-                        }
-                        return
-                    }
-                } catch {}
-                await MainActor.run { isSearching = false; error = "Can't reach \(input)" }
-            } else {
-                for port in 7860...7869 {
-                    let url = URL(string: "http://\(input):\(port)/status")!
-                    var request = URLRequest(url: url)
-                    request.timeoutInterval = 3
-                    do {
-                        let (_, response) = try await URLSession.shared.data(for: request)
-                        if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                            await MainActor.run {
-                                isSearching = false
-                                bridgeURL = URL(string: "http://\(input):\(port)")
-                                codeFocused = true
-                            }
-                            return
-                        }
-                    } catch { continue }
-                }
-                await MainActor.run {
-                    isSearching = false
-                    self.error = "Can't reach \(input)"
-                }
-            }
+    private var statusText: String {
+        if !connectivity.isActivated {
+            return "Waiting for Apple Watch connectivity"
         }
-    }
-
-    private func searchForBridge() {
-        isSearching = true
-        error = nil
-        Task {
-            let url = await bridge.discover()
-            await MainActor.run {
-                isSearching = false
-                bridgeURL = url
-                if url != nil { codeFocused = true }
-                else { ipFocused = true }
-            }
+        if connectivity.isReachable {
+            return "Bring the iPhone app to foreground to sync sessions"
         }
-    }
-
-    private func submitCode(_ code: String) {
-        guard let url = bridgeURL, !isConnecting else { return }
-        isConnecting = true
-        error = nil
-
-        Task {
-            do {
-                try await bridge.pair(baseURL: url, code: code)
-                await MainActor.run {
-                    session.isPaired = true
-                    session.sessionState = SessionState(
-                        connection: .connected, activity: .idle,
-                        machineName: "Mac", modelName: nil,
-                        workingDirectory: nil,
-                        elapsedSeconds: 0, filesChanged: 0, linesAdded: 0,
-                        transportMode: .lan
-                    )
-                    session.appendLine(TerminalLine(text: "Connected to bridge", type: .system))
-                    session.startEventStream()
-                }
-            } catch {
-                await MainActor.run {
-                    self.isConnecting = false
-                    self.error = error.localizedDescription
-                    self.code = ""
-                }
-            }
-        }
+        return "Keep iPhone nearby, then open the iPhone app"
     }
 }
 
-#Preview { OnboardingView().environmentObject(WatchViewState.shared) }
+#Preview {
+    OnboardingView().environmentObject(WatchViewState.shared)
+}

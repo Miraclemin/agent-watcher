@@ -1,7 +1,7 @@
 {
   "name": "claude-watch-bridge",
   "version": "1.0.0",
-  "description": "Bridge server between Claude Code and Agent Watch iOS app",
+  "description": "Bridge server between Claude Code and Agent Watcher iOS app",
   "type": "module",
   "main": "server.js",
   "scripts": {

@@ -28,6 +28,10 @@ enum Theme {
 struct ClaudeWatchWatchApp: App {
     @StateObject private var sessionManager = WatchViewState.shared
 
+    init() {
+        WatchSessionManager.shared.activate()
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {

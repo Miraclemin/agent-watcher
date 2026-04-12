@@ -1,5 +1,5 @@
 #!/bin/bash
-# Agent Watch — Install global hooks so ALL Claude Code sessions stream to the bridge.
+# Agent Watcher — Install global hooks so ALL Claude Code sessions stream to the bridge.
 #
 # Usage: ./setup-hooks.sh [port]
 #   port: bridge server port (default: 7860)
@@ -17,6 +17,7 @@ SETTINGS="$HOME/.claude/settings.json"
 if [ "$1" = "--remove" ]; then
   # Remove codex wrapper
   rm -f "$HOME/.local/bin/codex-watch" 2>/dev/null && echo "Removed codex-watch wrapper" || true
+  rm -f "$HOME/.local/bin/claude-watch" 2>/dev/null && echo "Removed claude-watch wrapper" || true
 
   if [ ! -f "$SETTINGS" ]; then
     echo "No settings file found at $SETTINGS"
@@ -52,16 +53,16 @@ if changed:
         del settings['hooks']
     with open('$SETTINGS', 'w') as f:
         json.dump(settings, f, indent=2)
-    print('Agent Watch hooks removed from $SETTINGS')
+    print('Agent Watcher hooks removed from $SETTINGS')
 else:
-    print('No Agent Watch hooks found.')
+    print('No Agent Watcher hooks found.')
 "
   exit 0
 fi
 
 # ── Install mode ─────────────────────────────────────────────────────────────
 
-echo "Installing Agent Watch hooks..."
+echo "Installing Agent Watcher hooks..."
 echo "  Bridge URL: ${BRIDGE_URL}"
 echo "  Settings:   ${SETTINGS}"
 echo ""
@@ -175,6 +176,55 @@ for event in new_hooks:
 
 echo ""
 
+mkdir -p "$HOME/.local/bin"
+
+# ── Claude wrapper ────────────────────────────────────────────────────────────
+
+if command -v claude &>/dev/null; then
+  echo "Claude detected. Installing Claude wrapper..."
+  CLAUDE_WRAPPER="$HOME/.local/bin/claude-watch"
+
+  cat > "$CLAUDE_WRAPPER" << 'WRAPPER_EOF'
+#!/bin/bash
+# claude-watch: Runs Claude and pre-registers the current terminal with Agent Watch.
+BRIDGE_URL="http://127.0.0.1:${CLAUDE_WATCH_PORT:-7860}"
+
+if curl -s --connect-timeout 1 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
+  TTY_PATH="$(tty 2>/dev/null || true)"
+  if [ -n "$TTY_PATH" ] && [ "$TTY_PATH" != "not a tty" ]; then
+    python3 - <<'PY' "$BRIDGE_URL" "$PWD" "$$" "$TTY_PATH"
+import json, sys, urllib.request
+
+bridge_url, cwd, pid, tty = sys.argv[1:5]
+payload = json.dumps({
+    "source": "claude",
+    "cwd": cwd,
+    "pid": int(pid),
+    "tty": tty,
+}).encode("utf-8")
+
+req = urllib.request.Request(
+    f"{bridge_url}/hooks/register-terminal",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+)
+try:
+    urllib.request.urlopen(req, timeout=1)
+except Exception:
+    pass
+PY
+  fi
+fi
+
+exec claude "$@"
+WRAPPER_EOF
+
+  chmod +x "$CLAUDE_WRAPPER"
+  echo "  Created: $CLAUDE_WRAPPER"
+  echo "  Use 'claude-watch' instead of 'claude' for precise tmux session mapping"
+  echo ""
+fi
+
 # ── Codex hooks ──────────────────────────────────────────────────────────────
 
 CODEX_CONFIG="$HOME/.codex/config.toml"
@@ -189,31 +239,67 @@ if command -v codex &>/dev/null; then
 
   cat > "$WRAPPER" << 'WRAPPER_EOF'
 #!/bin/bash
-# codex-watch: Runs Codex and streams events to Agent Watch bridge.
+# codex-watch: Runs Codex and streams events to Agent Watcher bridge.
 # Drop-in replacement for `codex` — use `codex-watch` instead.
 BRIDGE_URL="http://127.0.0.1:${CLAUDE_WATCH_PORT:-7860}"
+
+register_terminal() {
+  local agent_pid="$1"
+  local tty_path
+
+  if ! curl -s --connect-timeout 1 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
+    return 1
+  fi
+
+  tty_path="$(tty 2>/dev/null || true)"
+  if [ -z "$tty_path" ] || [ "$tty_path" = "not a tty" ]; then
+    return 1
+  fi
+
+  python3 - <<'PY' "$BRIDGE_URL" "$PWD" "$agent_pid" "$tty_path"
+import json, sys, time, urllib.request
+
+bridge_url, cwd, pid, tty = sys.argv[1:5]
+payload = json.dumps({
+    "source": "codex",
+    "cwd": cwd,
+    "pid": int(pid),
+    "tty": tty,
+    "createdAt": int(time.time() * 1000),
+}).encode("utf-8")
+
+req = urllib.request.Request(
+    f"{bridge_url}/hooks/register-terminal",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+)
+try:
+    urllib.request.urlopen(req, timeout=1)
+except Exception:
+    pass
+PY
+}
 
 # If bridge isn't running, just run codex normally
 if ! curl -s --connect-timeout 1 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
   exec codex "$@"
 fi
 
-# For non-exec commands (login, mcp, etc), run directly
 case "$1" in
-  exec|e) ;; # continue to bridge mode
-  "") ;; # interactive — can't bridge, run normally
-  *) exec codex "$@" ;;
-esac
-
-# Run codex exec with --json and pipe to bridge
-codex "$@" --json 2>/dev/null | while IFS= read -r line; do
-  TYPE=$(echo "$line" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('type',''))" 2>/dev/null || true)
-  case "$TYPE" in
-    item.completed)
-      # Forward the whole event — let the bridge parse it
-      curl -s -X POST "${BRIDGE_URL}/hooks/tool-output" \
-        -H "Content-Type: application/json" \
-        -d "$(echo "$line" | python3 -c "
+  exec|e)
+    FIFO_PATH="$(mktemp -u "${TMPDIR:-/tmp}/codex-watch.XXXXXX")"
+    mkfifo "$FIFO_PATH"
+    codex "$@" --json 2>/dev/null > "$FIFO_PATH" &
+    CODEX_PID=$!
+    register_terminal "$CODEX_PID"
+    while IFS= read -r line; do
+      TYPE=$(echo "$line" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('type',''))" 2>/dev/null || true)
+      case "$TYPE" in
+        item.completed)
+          # Forward the whole event — let the bridge parse it
+          curl -s -X POST "${BRIDGE_URL}/hooks/tool-output" \
+            -H "Content-Type: application/json" \
+            -d "$(echo "$line" | python3 -c "
 import sys,json
 e=json.load(sys.stdin)
 item=e.get('item',{})
@@ -232,14 +318,27 @@ if out:
 else:
     print('{}')
 " 2>/dev/null)" > /dev/null 2>&1 &
-      ;;
-    turn.completed)
-      curl -s -X POST "${BRIDGE_URL}/hooks/stop" \
-        -H "Content-Type: application/json" \
-        -d '{"source":"codex"}' > /dev/null 2>&1 &
-      ;;
-  esac
-done
+          ;;
+        turn.completed)
+          curl -s -X POST "${BRIDGE_URL}/hooks/stop" \
+            -H "Content-Type: application/json" \
+            -d '{"source":"codex"}' > /dev/null 2>&1 &
+          ;;
+      esac
+    done < "$FIFO_PATH"
+    wait "$CODEX_PID"
+    STATUS=$?
+    rm -f "$FIFO_PATH"
+    exit "$STATUS"
+    ;;
+  ""|resume|-*)
+    register_terminal "$$"
+    exec codex "$@"
+    ;;
+  *)
+    exec codex "$@"
+    ;;
+esac
 WRAPPER_EOF
 
   chmod +x "$WRAPPER"
@@ -255,6 +354,7 @@ echo "Done! Sessions will stream to the bridge."
 echo ""
 echo "Usage:"
 echo "  1. Start bridge:  cd skill/bridge && node server.js"
-echo "  2. Claude Code:   just use normally (hooks auto-forward)"
+echo "  2. Claude Code:   use 'claude-watch' for precise terminal/session binding"
+echo "  3. Codex:         use 'codex-watch exec \"prompt\"' for bridged exec flows"
 echo ""
 echo "To remove:  ./setup-hooks.sh --remove"

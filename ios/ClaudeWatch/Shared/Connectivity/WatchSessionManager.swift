@@ -9,6 +9,13 @@ import Combine
 /// Conforms to `ObservableObject` so SwiftUI views can observe connectivity changes.
 final class WatchSessionManager: NSObject, ObservableObject {
 
+    struct BridgeCredentialsSync: Equatable {
+        let baseURL: URL?
+        let token: String?
+        let machineName: String?
+        let cleared: Bool
+    }
+
     // MARK: - Singleton
 
     static let shared = WatchSessionManager()
@@ -26,6 +33,15 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     /// Called when the application context is updated by the counterpart.
     var onApplicationContextReceived: (([String: Any]) -> Void)?
+
+    /// Called when bridge credentials are synced from the companion iPhone.
+    var onBridgeCredentialsReceived: ((BridgeCredentialsSync) -> Void)?
+
+    /// Called on iPhone when the watch explicitly requests current bridge credentials.
+    var onBridgeCredentialsRequested: (() -> Void)?
+
+    /// Called on iPhone when the watch requests the latest relay snapshot.
+    var onRelaySnapshotRequested: (() -> Void)?
 
     // MARK: - Private
 
@@ -110,6 +126,80 @@ final class WatchSessionManager: NSObject, ObservableObject {
             "cf_client_secret": clientSecret
         ]
         session.transferUserInfo(payload)
+    }
+
+    /// Syncs bridge URL + token to the Apple Watch so the watch can reuse the
+    /// phone pairing without asking for a second 6-digit code.
+    func syncBridgeCredentials(baseURL: URL, token: String, machineName: String?) {
+        guard let session else { return }
+
+        var payload: [String: Any] = [
+            "_bridgeConfig": true,
+            "bridge_url": baseURL.absoluteString,
+            "bridge_token": token
+        ]
+        if let machineName, !machineName.isEmpty {
+            payload["machine_name"] = machineName
+        }
+
+        do {
+            try session.updateApplicationContext(payload)
+        } catch {
+            print("[WatchSessionManager] Failed to update bridge credentials context: \(error)")
+        }
+        session.transferUserInfo(payload)
+    }
+
+    func clearBridgeCredentials() {
+        guard let session else { return }
+
+        let payload: [String: Any] = [
+            "_bridgeConfig": true,
+            "bridge_cleared": true
+        ]
+
+        do {
+            try session.updateApplicationContext(payload)
+        } catch {
+            print("[WatchSessionManager] Failed to clear bridge credentials context: \(error)")
+        }
+        session.transferUserInfo(payload)
+    }
+
+    /// Watch-side pull path for cases where the companion was already paired
+    /// before the watch app launched or was reinstalled.
+    func requestBridgeCredentialsSync() {
+        guard let session else { return }
+
+        let payload: [String: Any] = [
+            "_bridgeConfigRequest": true
+        ]
+
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil) { error in
+                print("[WatchSessionManager] Failed to request bridge credentials: \(error)")
+                session.transferUserInfo(payload)
+            }
+        } else {
+            session.transferUserInfo(payload)
+        }
+    }
+
+    func requestRelaySnapshot() {
+        guard let session else { return }
+
+        let payload: [String: Any] = [
+            "_relaySnapshotRequest": true
+        ]
+
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil) { error in
+                print("[WatchSessionManager] Failed to request relay snapshot: \(error)")
+                session.transferUserInfo(payload)
+            }
+        } else {
+            session.transferUserInfo(payload)
+        }
     }
 
     #if os(iOS)
@@ -233,6 +323,31 @@ extension WatchSessionManager: WCSessionDelegate {
                 UserDefaults.standard.set(secret, forKey: "cf_client_secret")
                 print("[WatchSessionManager] Cloudflare credentials synced from companion")
             }
+            return
+        }
+
+        if dictionary["_bridgeConfig"] as? Bool == true {
+            let cleared = dictionary["bridge_cleared"] as? Bool == true
+            let credentials = BridgeCredentialsSync(
+                baseURL: URL(string: dictionary["bridge_url"] as? String ?? ""),
+                token: dictionary["bridge_token"] as? String,
+                machineName: (dictionary["machine_name"] as? String)?.isEmpty == false
+                    ? dictionary["machine_name"] as? String
+                    : nil,
+                cleared: cleared
+            )
+
+            onBridgeCredentialsReceived?(credentials)
+            return
+        }
+
+        if dictionary["_bridgeConfigRequest"] as? Bool == true {
+            onBridgeCredentialsRequested?()
+            return
+        }
+
+        if dictionary["_relaySnapshotRequest"] as? Bool == true {
+            onRelaySnapshotRequested?()
             return
         }
 

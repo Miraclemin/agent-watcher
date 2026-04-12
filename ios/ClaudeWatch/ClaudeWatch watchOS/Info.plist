@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Agent Watch</string>
+	<string>Agent Watcher</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -21,9 +21,9 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Agent Watch needs microphone access to transcribe your voice commands.</string>
+	<string>Agent Watcher needs microphone access to transcribe your voice commands.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Agent Watch uses speech recognition to convert your voice commands to text.</string>
+	<string>Agent Watcher uses speech recognition to convert your voice commands to text.</string>
 	<key>WKApplication</key>
 	<true/>
 	<key>WKCompanionAppBundleIdentifier</key>

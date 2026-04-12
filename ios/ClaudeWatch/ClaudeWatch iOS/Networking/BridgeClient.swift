@@ -1,6 +1,6 @@
 import Foundation
 
-/// HTTP client for communicating with the Agent Watch bridge server.
+/// HTTP client for communicating with the Agent Watcher bridge server.
 final class BridgeClient {
 
     // MARK: - Errors
@@ -36,8 +36,10 @@ final class BridgeClient {
 
     init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 30
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 60
+        config.waitsForConnectivity = true
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: config)
 
         // Restore saved token
@@ -65,6 +67,11 @@ final class BridgeClient {
 
     var isPaired: Bool {
         token != nil && baseURL != nil
+    }
+
+    var usesRemoteTunnel: Bool {
+        guard let baseURL else { return false }
+        return baseURL.scheme?.lowercased() == "https"
     }
 
     func clearCredentials() {
@@ -212,7 +219,7 @@ final class BridgeClient {
             "behavior": allow ? "allow" : "deny"
         ]
         if !allow {
-            decision["message"] = "Denied from Agent Watch app"
+            decision["message"] = "Denied from Agent Watcher app"
         }
         let body: [String: Any] = [
             "permissionId": requestId,
@@ -312,11 +319,20 @@ final class BridgeClient {
     }
 
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        var req = request
+        req.addCloudflareAccessHeaders()
+
         do {
-            var req = request
-            req.addCloudflareAccessHeaders()
             return try await session.data(for: req)
         } catch {
+            if usesRemoteTunnel {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                do {
+                    return try await session.data(for: req)
+                } catch {
+                    throw BridgeError.networkError
+                }
+            }
             throw BridgeError.networkError
         }
     }
@@ -358,5 +374,13 @@ final class BridgeClient {
         let sharedTerminal: Bool?
         let externalSessionId: String?
         let tmuxSessionName: String?
+        let lastActivityAt: TimeInterval?
+        let recentLines: [BridgeRecentLineInfo]?
+    }
+
+    struct BridgeRecentLineInfo: Decodable {
+        let text: String
+        let type: String
+        let timestamp: TimeInterval?
     }
 }

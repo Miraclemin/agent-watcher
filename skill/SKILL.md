@@ -1,14 +1,14 @@
 ---
 name: claude-watch
-description: Bridge your Claude Code session to the Agent Watch app on Apple Watch
+description: Bridge your Claude Code session to the Agent Watcher app on Apple Watch
 author: shobhit
 version: 0.1.0
 ---
 
-# Agent Watch Bridge
+# Agent Watcher Bridge
 
 Starts a local bridge server that connects your active Claude Code session
-to the Agent Watch iOS/watchOS app.
+to the Agent Watcher iOS/watchOS app.
 
 ## What it does
 - Runs a Node.js bridge server on your LAN
@@ -18,7 +18,7 @@ to the Agent Watch iOS/watchOS app.
 
 ## Usage
 Run `/claude-watch` to start the bridge.
-Enter the pairing code in the Agent Watch iPhone app.
+Enter the pairing code in the Agent Watcher iPhone app.
 
 ## Setup
 The bridge requires Node.js 18+ and the `node-pty` package.

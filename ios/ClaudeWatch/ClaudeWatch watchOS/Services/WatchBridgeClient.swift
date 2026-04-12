@@ -7,6 +7,7 @@ class WatchBridgeClient: ObservableObject {
 
     @Published var baseURL: URL?
     @Published var token: String?
+    @Published var lastKnownSessions: [AgentSession] = []
 
     var isPaired: Bool { token != nil && baseURL != nil }
 
@@ -77,6 +78,7 @@ class WatchBridgeClient: ObservableObject {
             let result = try JSONDecoder().decode(PairResponse.self, from: data)
             self.baseURL = baseURL
             self.token = result.token
+            self.lastKnownSessions = result.sessions ?? []
             UserDefaults.standard.set(baseURL.absoluteString, forKey: "watch_bridge_url")
             UserDefaults.standard.set(result.token, forKey: "watch_bridge_token")
         } else if http.statusCode == 429 {
@@ -86,8 +88,7 @@ class WatchBridgeClient: ObservableObject {
         }
     }
 
-    /// Fetch latest events from bridge (polling — simpler than SSE for watch)
-    func fetchEvents(since lastEventId: Int = 0) async throws -> [BridgeEvent] {
+    func fetchStatus() async throws -> BridgeStatus {
         guard let baseURL, let token else { throw BridgeError.notPaired }
         let url = baseURL.appendingPathComponent("status")
         var request = URLRequest(url: url)
@@ -95,12 +96,30 @@ class WatchBridgeClient: ObservableObject {
         request.addCloudflareAccessHeaders()
         let (data, _) = try await session.data(for: request)
         let status = try JSONDecoder().decode(BridgeStatus.self, from: data)
+        await MainActor.run {
+            self.lastKnownSessions = status.sessions ?? []
+        }
+        return status
+    }
+
+    /// Fetch latest events from bridge (polling — simpler than SSE for watch)
+    func fetchEvents(since lastEventId: Int = 0) async throws -> [BridgeEvent] {
+        let status = try await fetchStatus()
         return [BridgeEvent(state: status.state, hasPty: status.hasPty)]
+    }
+
+    func applyPairedCredentials(baseURL: URL, token: String, sessions: [AgentSession] = []) {
+        self.baseURL = baseURL
+        self.token = token
+        self.lastKnownSessions = sessions
+        UserDefaults.standard.set(baseURL.absoluteString, forKey: "watch_bridge_url")
+        UserDefaults.standard.set(token, forKey: "watch_bridge_token")
     }
 
     func unpair() {
         token = nil
         baseURL = nil
+        lastKnownSessions = []
         UserDefaults.standard.removeObject(forKey: "watch_bridge_url")
         UserDefaults.standard.removeObject(forKey: "watch_bridge_token")
     }
@@ -122,11 +141,13 @@ class WatchBridgeClient: ObservableObject {
     struct PairResponse: Decodable {
         let token: String
         let sessionId: String
+        let sessions: [AgentSession]?
     }
 
     struct BridgeStatus: Decodable {
         let state: String
         let sessionId: String
+        let sessions: [AgentSession]?
         let hasPty: Bool
         let sseClients: Int
         let pendingPermissions: Int

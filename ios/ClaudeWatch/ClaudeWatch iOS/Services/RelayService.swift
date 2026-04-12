@@ -62,6 +62,16 @@ final class RelayService: ObservableObject {
         isPaired = bridgeClient.isPaired
         setupWatchMessageHandler()
         setupSSEEventHandler()
+        sessionManager.onRelaySnapshotRequested = { [weak self] in
+            Task { @MainActor in
+                self?.pushWatchSnapshot()
+            }
+        }
+        sessionManager.onBridgeCredentialsRequested = { [weak self] in
+            Task { @MainActor in
+                self?.syncWatchBridgeCredentials()
+            }
+        }
 
         if isPaired {
             Task { await reconnect() }
@@ -110,6 +120,8 @@ final class RelayService: ObservableObject {
 
         print("[RelayService] isPaired = true, starting event stream")
 
+        syncWatchBridgeCredentials()
+
         // Start SSE connection
         startEventStream()
         startElapsedTimer()
@@ -131,6 +143,8 @@ final class RelayService: ObservableObject {
 
         UserDefaults.standard.set(urlString, forKey: "bridge_url")
         UserDefaults.standard.removeObject(forKey: "bridge_host")
+
+        syncWatchBridgeCredentials()
 
         startEventStream()
         startElapsedTimer()
@@ -157,6 +171,8 @@ final class RelayService: ObservableObject {
         UserDefaults.standard.set(service.machineName, forKey: "paired_machine_name")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
 
+        syncWatchBridgeCredentials()
+
         startEventStream()
         startElapsedTimer()
         updateWatchState()
@@ -177,14 +193,17 @@ final class RelayService: ObservableObject {
         workingDirectory = nil
         elapsedSeconds = 0
         recentTerminalLines = []
+        sessions = []
+        focusedSessionId = nil
+        pendingApproval = nil
+        pendingApprovalSessionId = nil
         connectionState = .disconnected
 
         UserDefaults.standard.removeObject(forKey: "paired_machine_name")
         UserDefaults.standard.removeObject(forKey: "last_connected")
 
-        // Notify watch
-        let state = SessionState.disconnected
-        sessionManager.updateApplicationContext(with: state)
+        sessionManager.clearBridgeCredentials()
+        updateWatchState()
     }
 
     func clearPairingNotice() {
@@ -202,7 +221,9 @@ final class RelayService: ObservableObject {
         }
 
         connectionState = .connecting
+        syncWatchBridgeCredentials()
         startEventStream()
+        Task { await refreshSessionsFromBridgeStatus() }
         startElapsedTimer()
         restartHeartbeatTimerIfNeeded()
     }
@@ -235,6 +256,7 @@ final class RelayService: ObservableObject {
                     self?.connectionState = .connected
                     self?.lastConnected = Date()
                     UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "last_connected")
+                    Task { await self?.refreshSessionsFromBridgeStatus() }
                     self?.restartHeartbeatTimerIfNeeded()
                     self?.updateWatchState()
                 case .connecting:
@@ -442,6 +464,7 @@ final class RelayService: ObservableObject {
 
         let approval = ApprovalRequest(
             permissionId: permissionId,
+            sessionId: targetSessionId,
             toolName: toolName,
             actionSummary: desc,
             question: question,
@@ -452,6 +475,9 @@ final class RelayService: ObservableObject {
         pendingApproval = approval
         pendingApprovalSessionId = targetSessionId
         claimPendingApprovalIfNeeded(preferredSessionId: targetSessionId)
+        if targetSessionId != nil && targetSession == nil {
+            Task { await refreshSessionsFromBridgeStatus(preferredSessionId: targetSessionId) }
+        }
 
         // Haptic feedback
         UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
@@ -464,7 +490,15 @@ final class RelayService: ObservableObject {
         appendToSession(line, sessionId: sessionId)
 
         // Forward to watch
-        let watchRequest = ApprovalRequest(toolName: toolName, actionSummary: desc, question: question, options: finalOptions, readOnly: !sessionIsWritable)
+        let watchRequest = ApprovalRequest(
+            permissionId: permissionId,
+            sessionId: targetSessionId,
+            toolName: toolName,
+            actionSummary: desc,
+            question: question,
+            options: finalOptions,
+            readOnly: !sessionIsWritable
+        )
         let message = WatchMessage.approvalRequestMessage(watchRequest)
         sessionManager.send(message)
 
@@ -514,24 +548,25 @@ final class RelayService: ObservableObject {
 
     /// Sends a text command to the bridge (iOS equivalent of watchOS voice input).
     func sendCommand(text: String, sessionId: String? = nil) {
-        let sid = sessionId ?? sessions.first(where: { $0.activity == .running })?.id
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+
+        let requestedSession = sessionId.flatMap { session(for: $0) }
+        let fallbackSession = requestedSession.flatMap { preferredWritableSession(for: $0) }
+        let sid = requestedSession?.writable == true
+            ? requestedSession?.id
+            : fallbackSession?.id ?? sessionId ?? preferredSessionId()
+
         focusedSessionId = sid
         if let sid {
             setActivity(.running, for: sid)
             markSessionVisualActivity(sid)
         }
 
-        let shouldEchoLocally = {
-            guard let sid, let session = session(for: sid) else { return true }
-            return !session.sharedTerminal
-        }()
-
-        if shouldEchoLocally {
-            let cmdLine = TerminalLine(text: "> \(text)", type: .command, sessionId: sid)
-            terminalBuffer.append(cmdLine)
-            _ = appendToSessionIfNotDuplicate(cmdLine, sessionId: sid)
-            recentTerminalLines = terminalBuffer.getLast(15)
-        }
+        let cmdLine = TerminalLine(text: "> \(trimmedText)", type: .command, sessionId: sid)
+        terminalBuffer.append(cmdLine)
+        _ = appendToSessionIfNotDuplicate(cmdLine, sessionId: sid)
+        recentTerminalLines = terminalBuffer.getLast(15)
 
         isThinking = true
 
@@ -539,7 +574,31 @@ final class RelayService: ObservableObject {
 
         Task {
             do {
-                try await bridgeClient.sendCommand(text: text + "\n", sessionId: sid)
+                if let requestedSession, !requestedSession.writable, fallbackSession == nil {
+                    let spawnedSessionId = try await bridgeClient.spawnSession(
+                        agent: requestedSession.agent.rawValue,
+                        cwd: requestedSession.cwd,
+                        initialCommand: trimmedText
+                    )
+
+                    await MainActor.run {
+                        if let spawnedSessionId {
+                            self.focusedSessionId = spawnedSessionId
+                            let line = TerminalLine(
+                                text: "Opened a writable \(requestedSession.agent.rawValue) session for voice input.",
+                                type: .system,
+                                sessionId: spawnedSessionId
+                            )
+                            self.terminalBuffer.append(line)
+                            self.appendToSession(line, sessionId: spawnedSessionId)
+                            self.recentTerminalLines = self.terminalBuffer.getLast(15)
+                            self.updateWatchState()
+                        }
+                    }
+                    return
+                }
+
+                try await bridgeClient.sendCommand(text: trimmedText + "\n", sessionId: sid)
             } catch BridgeClient.BridgeError.unauthorized {
                 await MainActor.run { self.handleBridgeAuthRejected() }
             } catch let BridgeClient.BridgeError.serverError(message) {
@@ -773,11 +832,6 @@ final class RelayService: ObservableObject {
             return exactExternal
         }
 
-        if let tmuxSessionName,
-           let exactTmux = sessions.firstIndex(where: { $0.tmuxSessionName == tmuxSessionName }) {
-            return exactTmux
-        }
-
         return nil
     }
 
@@ -963,13 +1017,8 @@ final class RelayService: ObservableObject {
         guard let rawSessions = json["sessions"] as? [[String: Any]] else {
             return
         }
-
-        let previousFocused = focusedSessionId
-        var syncedSessions: [AgentSession] = []
-
-        for raw in rawSessions {
-            guard let sessionId = raw["id"] as? String else { continue }
-
+        let snapshot = rawSessions.compactMap { raw -> AgentSession? in
+            guard let sessionId = raw["id"] as? String else { return nil }
             let agent = AgentType(rawValue: raw["agent"] as? String ?? "claude") ?? .claude
             let cwd = raw["cwd"] as? String ?? ""
             let folderName = raw["folderName"] as? String ?? ""
@@ -981,30 +1030,12 @@ final class RelayService: ObservableObject {
             let tmuxSessionName = raw["tmuxSessionName"] as? String
             let lastActivityAt = raw["lastActivityAt"] as? TimeInterval
 
-            let existingIndex = indexForSession(
-                id: sessionId,
-                externalSessionId: externalSessionId,
-                tmuxSessionName: tmuxSessionName
-            )
-            let existing = existingIndex.flatMap { sessions.indices.contains($0) ? sessions[$0] : nil }
-
-            let activity: SessionActivity = {
-                if existing?.pendingApproval != nil || existing?.activity == .waitingApproval {
-                    return .waitingApproval
-                }
-                switch state {
-                case "running": return .running
-                case "ended": return .ended
-                default: return .idle
-                }
-            }()
-
-            var synced = AgentSession(
+            var session = AgentSession(
                 id: sessionId,
                 agent: agent,
                 cwd: cwd,
                 folderName: folderName,
-                activity: activity,
+                activity: sessionActivity(for: state),
                 backend: backend,
                 writable: writable,
                 sharedTerminal: sharedTerminal,
@@ -1012,33 +1043,11 @@ final class RelayService: ObservableObject {
                 tmuxSessionName: tmuxSessionName,
                 lastActivityAt: lastActivityAt
             )
-            synced.terminalLines = existing?.terminalLines ?? []
-            synced.pendingApproval = existing?.pendingApproval
-            synced.lastVisualActivityAt = existing?.lastVisualActivityAt
-            syncedSessions.append(synced)
+            session.terminalLines = parseRecentLines(raw["recentLines"], sessionId: sessionId)
+            return session
         }
 
-        sessions = syncedSessions
-        claimPendingApprovalIfNeeded()
-
-        if let previousFocused,
-           sessions.contains(where: { $0.id == previousFocused }) {
-            focusedSessionId = previousFocused
-        } else if focusedSessionId == nil || !sessions.contains(where: { $0.id == focusedSessionId }) {
-            focusedSessionId = preferredSessionId()
-        }
-
-        if pendingApproval?.permissionId != nil,
-           !sessions.contains(where: { $0.pendingApproval?.permissionId == pendingApproval?.permissionId }) {
-            pendingApproval = nil
-            pendingApprovalSessionId = nil
-        }
-
-        if sessions.isEmpty {
-            isThinking = false
-        }
-
-        updateWatchState()
+        mergeSessionsSnapshot(snapshot)
     }
 
     private func handleConversationMessage(_ data: String) {
@@ -1248,23 +1257,19 @@ final class RelayService: ObservableObject {
     private func handleWatchMessage(_ message: WatchMessage) {
         switch message {
         case .voiceCommand(let cmd):
-            // Forward voice command to bridge as PTY input
-            Task {
-                try? await bridgeClient.sendCommand(text: cmd.transcribedText + "\n")
-            }
+            sendCommand(text: cmd.transcribedText, sessionId: cmd.sessionId)
 
         case .approvalResponse(let response):
-            // Forward approval response to bridge
-            let key = "pending_permission_\(response.requestId.uuidString)"
-            if let permissionId = UserDefaults.standard.string(forKey: key) {
-                Task {
-                    try? await bridgeClient.respondToApproval(
-                        requestId: permissionId,
-                        allow: response.approved
-                    )
-                }
-                UserDefaults.standard.removeObject(forKey: key)
-            }
+            guard let approval = approvalForWatchResponse(
+                permissionId: response.permissionId,
+                sessionId: response.sessionId
+            ) else { break }
+
+            respondToApprovalWithOption(
+                response.optionLabel,
+                index: response.optionIndex,
+                approval: approval
+            )
 
         default:
             break
@@ -1281,10 +1286,34 @@ final class RelayService: ObservableObject {
             elapsedSeconds: elapsedSeconds,
             filesChanged: 0,
             linesAdded: 0,
-            transportMode: .lan
+            transportMode: bridgeClient.usesRemoteTunnel ? .remote : .lan
         )
 
         sessionManager.updateApplicationContext(with: state)
+        sendWatchSessionsSnapshot()
+    }
+
+    private func approvalForWatchResponse(permissionId: String, sessionId: String?) -> ApprovalRequest? {
+        if pendingApproval?.permissionId == permissionId {
+            return pendingApproval
+        }
+
+        if let sessionId,
+           let session = sessions.first(where: { $0.id == sessionId || $0.externalSessionId == sessionId }),
+           session.pendingApproval?.permissionId == permissionId {
+            return session.pendingApproval
+        }
+
+        return sessions.first(where: { $0.pendingApproval?.permissionId == permissionId })?.pendingApproval
+    }
+
+    private func syncWatchBridgeCredentials() {
+        guard let baseURL = bridgeClient.baseURL, let token = bridgeClient.token else { return }
+        sessionManager.syncBridgeCredentials(
+            baseURL: baseURL,
+            token: token,
+            machineName: machineName
+        )
     }
 
     private var currentActivity: SessionActivity {
@@ -1294,6 +1323,10 @@ final class RelayService: ObservableObject {
         case .disconnected: return .ended
         case .iPhoneUnreachable: return .idle
         }
+    }
+
+    var currentTransportMode: SessionState.TransportMode {
+        bridgeClient.usesRemoteTunnel ? .remote : .lan
     }
 
     // MARK: - Terminal batching
@@ -1389,6 +1422,116 @@ final class RelayService: ObservableObject {
 
     private func publishSessions() {
         sessions = sessions
+        sendWatchSessionsSnapshot()
+    }
+
+    private func sessionActivity(for state: String) -> SessionActivity {
+        switch state {
+        case "running": return .running
+        case "ended": return .ended
+        default: return .idle
+        }
+    }
+
+    private func mergeSessionsSnapshot(_ snapshot: [AgentSession], requestedSessionId: String? = nil) {
+        let previousFocused = focusedSessionId
+        var syncedSessions: [AgentSession] = []
+
+        for incoming in snapshot {
+            let existingIndex = indexForSession(
+                id: incoming.id,
+                externalSessionId: incoming.externalSessionId,
+                tmuxSessionName: incoming.tmuxSessionName
+            )
+            let existing = existingIndex.flatMap { sessions.indices.contains($0) ? sessions[$0] : nil }
+
+            let activity: SessionActivity = {
+                if existing?.pendingApproval != nil || existing?.activity == .waitingApproval {
+                    return .waitingApproval
+                }
+                return incoming.activity
+            }()
+
+            var merged = AgentSession(
+                id: incoming.id,
+                agent: incoming.agent,
+                cwd: incoming.cwd,
+                folderName: incoming.folderName,
+                activity: activity,
+                backend: incoming.backend,
+                writable: incoming.writable,
+                sharedTerminal: incoming.sharedTerminal,
+                externalSessionId: incoming.externalSessionId,
+                tmuxSessionName: incoming.tmuxSessionName,
+                lastActivityAt: incoming.lastActivityAt
+            )
+            merged.terminalLines = mergeTerminalLines(
+                existing: existing?.terminalLines ?? [],
+                incoming: incoming.terminalLines
+            )
+            merged.pendingApproval = existing?.pendingApproval
+            merged.lastVisualActivityAt = existing?.lastVisualActivityAt
+            syncedSessions.append(merged)
+        }
+
+        sessions = syncedSessions
+        claimPendingApprovalIfNeeded(preferredSessionId: requestedSessionId)
+
+        if let previousFocused,
+           sessions.contains(where: { $0.id == previousFocused }) {
+            focusedSessionId = previousFocused
+        } else if focusedSessionId == nil || !sessions.contains(where: { $0.id == focusedSessionId }) {
+            focusedSessionId = preferredSessionId()
+        }
+
+        if pendingApproval?.permissionId != nil,
+           !sessions.contains(where: { $0.pendingApproval?.permissionId == pendingApproval?.permissionId }) {
+            pendingApproval = nil
+            pendingApprovalSessionId = nil
+        }
+
+        if sessions.isEmpty {
+            isThinking = false
+        }
+
+        rebuildTerminalCacheFromSessions()
+        updateWatchState()
+    }
+
+    private func refreshSessionsFromBridgeStatus(preferredSessionId requestedSessionId: String? = nil) async {
+        do {
+            let status = try await bridgeClient.fetchStatus()
+            let snapshot = (status.sessions ?? []).map { session in
+                var snapshotSession = AgentSession(
+                    id: session.id,
+                    agent: AgentType(rawValue: session.agent) ?? .claude,
+                    cwd: session.cwd,
+                    folderName: session.folderName,
+                    activity: sessionActivity(for: session.state),
+                    backend: session.backend ?? "external",
+                    writable: session.writable ?? false,
+                    sharedTerminal: session.sharedTerminal ?? ((session.backend ?? "external") == "tmux"),
+                    externalSessionId: session.externalSessionId,
+                    tmuxSessionName: session.tmuxSessionName,
+                    lastActivityAt: session.lastActivityAt
+                )
+                snapshotSession.terminalLines = parseRecentLines(session.recentLines, sessionId: session.id)
+                return snapshotSession
+            }
+
+            mergeSessionsSnapshot(snapshot, requestedSessionId: requestedSessionId)
+        } catch {
+            // Best-effort sync only; SSE remains the primary source of truth.
+        }
+    }
+
+    private func pushWatchSnapshot() {
+        updateWatchState()
+    }
+
+    private func sendWatchSessionsSnapshot() {
+        let message = WatchMessage.sessionsUpdate(.init(sessions: sessions))
+        sessionManager.send(message)
     }
 
     private func preferredSessionId() -> String? {
@@ -1412,6 +1555,92 @@ final class RelayService: ObservableObject {
         }
 
         return mostRecentSession(where: { _ in true })?.id
+    }
+
+    private func preferredWritableSession(for requestedSession: AgentSession) -> AgentSession? {
+        if requestedSession.writable {
+            return requestedSession
+        }
+
+        if let exact = mostRecentSession(where: {
+            $0.id == requestedSession.id && $0.writable
+        }) {
+            return exact
+        }
+
+        if let externalSessionId = requestedSession.externalSessionId,
+           let mirrored = mostRecentSession(where: {
+               $0.writable && ($0.id == externalSessionId || $0.externalSessionId == externalSessionId)
+           }) {
+            return mirrored
+        }
+
+        if let sameProject = mostRecentSession(where: {
+            $0.writable
+                && $0.agent == requestedSession.agent
+                && $0.cwd == requestedSession.cwd
+        }) {
+            return sameProject
+        }
+
+        if let sameAgent = mostRecentSession(where: {
+            $0.writable && $0.agent == requestedSession.agent
+        }) {
+            return sameAgent
+        }
+
+        return mostRecentSession(where: { $0.writable })
+    }
+
+    private func parseRecentLines(_ rawValue: Any?, sessionId: String) -> [TerminalLine] {
+        guard let rawLines = rawValue as? [[String: Any]] else { return [] }
+        return rawLines.compactMap { line in
+            guard let text = line["text"] as? String,
+                  let typeRaw = line["type"] as? String,
+                  let type = TerminalLine.LineType(rawValue: typeRaw) else { return nil }
+            let timestamp = (line["timestamp"] as? TimeInterval).map(Date.init(timeIntervalSince1970:)) ?? Date()
+            return TerminalLine(text: text, timestamp: timestamp, type: type, sessionId: sessionId)
+        }
+    }
+
+    private func parseRecentLines(_ lines: [BridgeClient.BridgeRecentLineInfo]?, sessionId: String) -> [TerminalLine] {
+        guard let lines else { return [] }
+        return lines.compactMap { line in
+            guard let type = TerminalLine.LineType(rawValue: line.type) else { return nil }
+            let timestamp = line.timestamp.map(Date.init(timeIntervalSince1970:)) ?? Date()
+            return TerminalLine(text: line.text, timestamp: timestamp, type: type, sessionId: sessionId)
+        }
+    }
+
+    private func mergeTerminalLines(existing: [TerminalLine], incoming: [TerminalLine]) -> [TerminalLine] {
+        guard !incoming.isEmpty else { return existing }
+
+        var merged: [TerminalLine] = []
+        var seen = Set<String>()
+
+        for line in (existing + incoming).sorted(by: { $0.timestamp < $1.timestamp }) {
+            let key = "\(line.type.rawValue)|\(line.text)"
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            merged.append(line)
+        }
+
+        if merged.count > 600 {
+            merged.removeFirst(merged.count - 600)
+        }
+        return merged
+    }
+
+    private func rebuildTerminalCacheFromSessions() {
+        terminalBuffer.clear()
+        let flattened = sessions
+            .flatMap(\.terminalLines)
+            .sorted { $0.timestamp < $1.timestamp }
+
+        for line in flattened.suffix(50) {
+            terminalBuffer.append(line)
+        }
+        recentTerminalLines = terminalBuffer.getLast(15)
     }
 
     private func mostRecentSession(where predicate: (AgentSession) -> Bool) -> AgentSession? {

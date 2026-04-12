@@ -64,7 +64,7 @@ struct PairingView: View {
 
     private var titleSection: some View {
         VStack(spacing: 8) {
-            Text("Agent Watch")
+            Text("Agent Watcher")
                 .font(.system(size: 28, weight: .bold))
                 .foregroundStyle(Color.claudeOrange)
 

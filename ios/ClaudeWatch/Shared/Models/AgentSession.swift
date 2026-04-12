@@ -26,6 +26,7 @@ struct AgentSession: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id, agent, cwd, folderName, activity
         case backend, writable, sharedTerminal, externalSessionId, tmuxSessionName, lastActivityAt
+        case terminalLines, pendingApproval, lastVisualActivityAt
     }
 
     func encode(to encoder: Encoder) throws {
@@ -41,6 +42,9 @@ struct AgentSession: Identifiable, Codable, Equatable {
         try c.encodeIfPresent(externalSessionId, forKey: .externalSessionId)
         try c.encodeIfPresent(tmuxSessionName, forKey: .tmuxSessionName)
         try c.encodeIfPresent(lastActivityAt, forKey: .lastActivityAt)
+        try c.encode(terminalLines, forKey: .terminalLines)
+        try c.encodeIfPresent(pendingApproval, forKey: .pendingApproval)
+        try c.encodeIfPresent(lastVisualActivityAt, forKey: .lastVisualActivityAt)
     }
 
     init(from decoder: Decoder) throws {
@@ -56,9 +60,9 @@ struct AgentSession: Identifiable, Codable, Equatable {
         externalSessionId = try c.decodeIfPresent(String.self, forKey: .externalSessionId)
         tmuxSessionName = try c.decodeIfPresent(String.self, forKey: .tmuxSessionName)
         lastActivityAt = try c.decodeIfPresent(TimeInterval.self, forKey: .lastActivityAt)
-        terminalLines = []
-        pendingApproval = nil
-        lastVisualActivityAt = nil
+        terminalLines = try c.decodeIfPresent([TerminalLine].self, forKey: .terminalLines) ?? []
+        pendingApproval = try c.decodeIfPresent(ApprovalRequest.self, forKey: .pendingApproval)
+        lastVisualActivityAt = try c.decodeIfPresent(Date.self, forKey: .lastVisualActivityAt)
     }
 
     init(
@@ -96,7 +100,7 @@ struct AgentSession: Identifiable, Codable, Equatable {
     }
 
     var displayName: String {
-        "\(agent.rawValue)-watch"
+        agent.rawValue
     }
 
     var backendLabel: String {
