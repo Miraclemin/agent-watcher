@@ -27,6 +27,7 @@ struct SessionState: Codable {
 
     enum TransportMode: String, Codable {
         case lan
+        case direct
         case remote
     }
 

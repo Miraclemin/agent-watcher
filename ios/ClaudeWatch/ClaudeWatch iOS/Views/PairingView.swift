@@ -16,14 +16,20 @@ struct PairingView: View {
     @State private var errorMessage: String = ""
     @State private var isConnecting: Bool = false
 
-    // Cloudflare Access credentials (for remote access via Cloudflare Tunnel)
+    // Cloudflare Access credentials (only needed for Cloudflare Tunnel / public remote hosts)
     @State private var cfClientId: String = UserDefaults.standard.string(forKey: "cf_client_id") ?? ""
     @State private var cfClientSecret: String = UserDefaults.standard.string(forKey: "cf_client_secret") ?? ""
 
-    /// True when the user enters a domain name (not a plain IP).
-    private var isCloudflareMode: Bool {
+    private var trimmedBridgeAddress: String {
         ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-            .contains(where: { $0.isLetter })
+    }
+
+    private var showsCloudflareSection: Bool {
+        BridgeClient.inputRequiresCloudflareAccess(trimmedBridgeAddress)
+    }
+
+    private var usesDirectPrivateLink: Bool {
+        BridgeClient.inputUsesDirectPrivateLink(trimmedBridgeAddress)
     }
 
     // MARK: - Body
@@ -41,7 +47,7 @@ struct PairingView: View {
                 if showManualIP {
                     ipEntrySection
 
-                    if isCloudflareMode {
+                    if showsCloudflareSection {
                         cloudflareSection
                     }
                 }
@@ -69,7 +75,7 @@ struct PairingView: View {
                 .foregroundStyle(Color.claudeOrange)
 
             Text(showManualIP
-                 ? "Enter your Mac's IP and the pairing code"
+                 ? "Enter your Mac's IP, Tailscale host, or bridge URL"
                  : "Enter the pairing code from your Mac")
                 .font(.system(size: 15))
                 .foregroundStyle(Color.subtleText)
@@ -79,7 +85,7 @@ struct PairingView: View {
 
     private var ipEntrySection: some View {
         HStack(spacing: 8) {
-            TextField("192.168.1.x or watch.example.com", text: $ipAddress)
+            TextField("192.168.1.x, 100.x.y.z, my-mac.ts.net, or watch.example.com", text: $ipAddress)
                 .keyboardType(.URL)
                 .autocorrectionDisabled()
                 .font(.system(size: 17, weight: .semibold, design: .monospaced))
@@ -140,7 +146,7 @@ struct PairingView: View {
                 .foregroundStyle(Color.subtleText)
         }
         .transition(.opacity.combined(with: .move(edge: .top)))
-        .animation(.easeInOut(duration: 0.25), value: isCloudflareMode)
+        .animation(.easeInOut(duration: 0.25), value: showsCloudflareSection)
     }
 
     private var digitFields: some View {
@@ -213,6 +219,13 @@ struct PairingView: View {
 
     private var bottomSection: some View {
         VStack(spacing: 12) {
+            if showManualIP && usesDirectPrivateLink {
+                Text("Direct private bridge detected. Tailscale and private IP addresses connect without Cloudflare Access.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.subtleText)
+                    .multilineTextAlignment(.center)
+            }
+
             if !showManualIP {
                 Button {
                     withAnimation {
@@ -274,18 +287,20 @@ struct PairingView: View {
                     let input = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !input.isEmpty else {
                         await MainActor.run {
-                            showPairingError("Please enter your Mac's IP or Cloudflare URL.")
+                            showPairingError("Please enter your Mac's IP, Tailscale host, or bridge URL.")
                         }
                         return
                     }
-                    // Detect Cloudflare URL (contains letters) vs plain IP (only digits/dots)
-                    let isCloudflareURL = input.contains(where: { $0.isLetter })
-                    if isCloudflareURL {
-                        // Save CF credentials before pairing so headers are included
+
+                    if BridgeClient.inputRequiresCloudflareAccess(input) {
                         saveCFCredentials()
-                        try await relayService.pairWithURL(input, code: code)
-                    } else {
+                    }
+
+                    if BridgeClient.inputUsesDirectPrivateLink(input),
+                       input.allSatisfy({ $0.isNumber || $0 == "." }) {
                         try await relayService.pairWithIP(input, code: code)
+                    } else {
+                        try await relayService.pairWithURL(input, code: code)
                     }
                 } else {
                     try await relayService.pair(code: code)
@@ -298,7 +313,7 @@ struct PairingView: View {
                     // If auto-discovery failed, suggest manual IP
                     if msg.contains("noServiceFound") || msg.contains("timed out") || msg.contains("not found") {
                         showManualIP = true
-                        showPairingError("Bridge not found automatically. Enter your Mac's IP address.")
+                        showPairingError("Bridge not found automatically. Enter your Mac's IP, Tailscale host, or bridge URL.")
                         isIPFocused = true
                     } else {
                         showPairingError("Connection failed: \(msg)")
@@ -322,10 +337,10 @@ struct PairingView: View {
         case .networkError:
             if !showManualIP {
                 showManualIP = true
-                showPairingError("Can't reach bridge. Enter your Mac's IP address.")
+                showPairingError("Can't reach bridge. Enter your Mac's IP, Tailscale host, or bridge URL.")
                 isIPFocused = true
             } else {
-                showPairingError("Cannot reach the bridge server. Check the IP and network.")
+                showPairingError("Cannot reach the bridge server. Check the address and network.")
             }
         case .serverError(let msg):
             showPairingError(msg)

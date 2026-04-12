@@ -152,6 +152,7 @@ struct StatusDashboard: View {
     private var transportLabel: String {
         switch session.sessionState.transportMode {
         case .lan: return "Local network"
+        case .direct: return "Direct private link"
         case .remote: return "Remote relay"
         }
     }

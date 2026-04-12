@@ -57,10 +57,11 @@ final class BridgeClient {
         UserDefaults.standard.set(urlString, forKey: "bridge_url")
     }
 
-    /// Configures the client with a full URL string (e.g. https://watch.example.com for Cloudflare Tunnel).
+    /// Configures the client with a full URL string.
+    /// Public hostnames default to HTTPS, while direct/private hosts
+    /// such as LAN IPs and Tailscale endpoints default to HTTP.
     func configureURL(_ urlString: String) {
-        var s = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !s.hasPrefix("http") { s = "https://" + s }
+        let s = Self.normalizeBridgeURLString(urlString)
         self.baseURL = URL(string: s)
         UserDefaults.standard.set(s, forKey: "bridge_url")
     }
@@ -72,6 +73,92 @@ final class BridgeClient {
     var usesRemoteTunnel: Bool {
         guard let baseURL else { return false }
         return baseURL.scheme?.lowercased() == "https"
+    }
+
+    var transportMode: SessionState.TransportMode {
+        guard let host = baseURL?.host?.lowercased() else { return .lan }
+        if Self.isTailscaleHost(host) || Self.isTailscaleAddress(host) {
+            return .direct
+        }
+        if usesRemoteTunnel {
+            return .remote
+        }
+        return .lan
+    }
+
+    static func normalizeBridgeURLString(_ rawValue: String) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            return trimmed
+        }
+
+        let scheme = requiresHTTPSByDefault(for: trimmed) ? "https" : "http"
+        return "\(scheme)://\(trimmed)"
+    }
+
+    static func inputRequiresCloudflareAccess(_ rawValue: String) -> Bool {
+        guard let host = hostForClassification(from: rawValue) else { return false }
+        return !isPlainIPAddress(host) && !isDirectPrivateHost(host)
+    }
+
+    static func inputUsesDirectPrivateLink(_ rawValue: String) -> Bool {
+        guard let host = hostForClassification(from: rawValue) else { return false }
+        return isDirectPrivateHost(host)
+    }
+
+    private static func requiresHTTPSByDefault(for rawValue: String) -> Bool {
+        guard let host = hostForClassification(from: rawValue) else { return true }
+        return !isDirectPrivateHost(host)
+    }
+
+    private static func hostForClassification(from rawValue: String) -> String? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let candidate = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
+        guard let components = URLComponents(string: candidate),
+              let host = components.host?.lowercased(),
+              !host.isEmpty else {
+            return nil
+        }
+        return host
+    }
+
+    private static func isDirectPrivateHost(_ host: String) -> Bool {
+        isPlainIPAddress(host) || isLocalHostname(host) || isTailscaleHost(host) || isTailscaleAddress(host)
+    }
+
+    private static func isLocalHostname(_ host: String) -> Bool {
+        host == "localhost" || host.hasSuffix(".local")
+    }
+
+    private static func isTailscaleHost(_ host: String) -> Bool {
+        host.hasSuffix(".ts.net")
+    }
+
+    private static func isTailscaleAddress(_ host: String) -> Bool {
+        if host.lowercased().hasPrefix("fd7a:115c:a1e0:") {
+            return true
+        }
+
+        let octets = host.split(separator: ".")
+        guard octets.count == 4 else { return false }
+        guard let first = Int(octets[0]), let second = Int(octets[1]) else { return false }
+        return first == 100 && (64...127).contains(second)
+    }
+
+    private static func isPlainIPAddress(_ host: String) -> Bool {
+        if host.contains(":") {
+            return true
+        }
+
+        let octets = host.split(separator: ".")
+        guard octets.count == 4 else { return false }
+        return octets.allSatisfy { part in
+            guard let value = Int(part), (0...255).contains(value) else { return false }
+            return String(value) == part || part == "0"
+        }
     }
 
     func clearCredentials() {

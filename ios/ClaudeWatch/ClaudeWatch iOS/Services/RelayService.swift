@@ -130,9 +130,9 @@ final class RelayService: ObservableObject {
         updateWatchState()
     }
 
-    /// Pairs using a full URL (for Cloudflare Tunnel: https://watch.example.com).
+    /// Pairs using a direct or remote bridge URL.
     func pairWithURL(_ urlString: String, code: String) async throws {
-        print("[RelayService] Cloudflare URL pair: \(urlString)")
+        print("[RelayService] Bridge URL pair: \(urlString)")
         bridgeClient.configureURL(urlString)
         try await bridgeClient.pair(code: code)
 
@@ -1286,7 +1286,7 @@ final class RelayService: ObservableObject {
             elapsedSeconds: elapsedSeconds,
             filesChanged: 0,
             linesAdded: 0,
-            transportMode: bridgeClient.usesRemoteTunnel ? .remote : .lan
+            transportMode: bridgeClient.transportMode
         )
 
         sessionManager.updateApplicationContext(with: state)
@@ -1326,7 +1326,7 @@ final class RelayService: ObservableObject {
     }
 
     var currentTransportMode: SessionState.TransportMode {
-        bridgeClient.usesRemoteTunnel ? .remote : .lan
+        bridgeClient.transportMode
     }
 
     // MARK: - Terminal batching

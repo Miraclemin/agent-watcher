@@ -235,7 +235,14 @@ struct ConnectionStatusView: View {
     private var connectionBadgeTitle: String {
         switch relayService.connectionState {
         case .connected:
-            return relayService.currentTransportMode == .remote ? "REMOTE" : "LAN"
+            switch relayService.currentTransportMode {
+            case .lan:
+                return "LAN"
+            case .direct:
+                return "DIRECT"
+            case .remote:
+                return "REMOTE"
+            }
         case .connecting: return "SYNC"
         case .disconnected: return "OFF"
         case .iPhoneUnreachable: return "PHONE"
