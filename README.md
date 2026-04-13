@@ -166,7 +166,64 @@ The pairing code is reusable:
 - It does not expire automatically while the bridge keeps running
 - One code can pair multiple iPhones / iPads / Watches
 
-### 5. Build the apps
+### 5. Run Claude Code / Codex on the Mac
+
+You have two ways to drive an agent session that the bridge can see:
+
+#### A. Launch from the Mac with `claude-watch` / `codex-watch` (recommended)
+
+`./skill/setup-hooks.sh` (step 3) installs two wrapper commands into `~/.local/bin`:
+
+- `claude-watch` — drop-in replacement for `claude`; registers the current terminal with the bridge before running Claude Code.
+- `codex-watch` — drop-in replacement for `codex`; additionally bridges `codex exec` events.
+
+Make sure `~/.local/bin` is on your `PATH`:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Verify:
+
+```bash
+which claude-watch
+which codex-watch
+```
+
+**Strongly recommended: run them inside tmux.** The bridge adopts any tmux pane that hosts a `claude-watch` / `codex-watch` terminal, which means:
+
+- The session survives a bridge restart (you can kill and relaunch `node server.js` without losing context).
+- You can reattach from any terminal and the phone / iPad keeps streaming.
+- Multiple panes can be tracked independently.
+
+```bash
+# One-time: create a work session
+tmux new -s dev
+
+# Inside tmux, start the agent
+claude-watch                  # Claude Code, interactive
+codex-watch                   # Codex, interactive
+codex-watch exec "your prompt"  # Codex, one-shot with streamed events
+
+# Detach with Ctrl-b d, reattach later with:
+tmux attach -t dev
+```
+
+Without tmux the wrappers still work, but if you close the terminal the session ends.
+
+#### B. Spawn a new session from the phone / iPad
+
+If you do not want to open a terminal on the Mac, you can let the app do it:
+
+1. Pair the iPhone / iPad to the bridge (next section).
+2. On the home screen tap the `+` button.
+3. Choose `New Claude Window` or `New Codex Window`.
+4. The bridge opens a new Terminal.app window on the Mac with the selected agent, already bridged.
+
+Use this when you are away from the Mac and need to start a fresh agent from the phone.
+
+### 6. Build the apps
 
 ```bash
 cd ios/ClaudeWatch
@@ -514,13 +571,14 @@ claude-watch/
 
 ## Common Usage Flow
 
-1. Start the bridge on the Mac.
-2. Start Claude Code or Codex on the Mac.
-3. Open the iPhone app.
-4. Pair once with the 6-digit code.
-5. Check the current session on phone or watch.
-6. Approve or deny actions remotely when needed.
-7. Dictate a short follow-up prompt from the watch or type from phone / iPad.
+1. Start the bridge on the Mac: `node skill/bridge/server.js`.
+2. Start Claude Code or Codex on the Mac, preferably inside tmux:
+   - `tmux new -s dev && claude-watch` (or `codex-watch`)
+   - Or skip this step and spawn the session later from the phone via the `+` button.
+3. Open the iPhone app and pair once with the 6-digit code.
+4. Check the current session on phone, iPad, or watch.
+5. Approve or deny actions remotely when needed.
+6. Dictate a short follow-up prompt from the watch or type from phone / iPad.
 
 ## Author
 

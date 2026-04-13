@@ -80,9 +80,6 @@ struct SessionView: View {
                 }
         }
         .background(Theme.Background.primary)
-        .sheet(item: $session.pendingApproval) { request in
-            ApprovalView(request: request)
-        }
     }
 
     private var visibleLines: [TerminalLine] {

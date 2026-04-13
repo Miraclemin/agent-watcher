@@ -172,7 +172,64 @@ PAIRING_CODE=123456 node skill/bridge/server.js
 - bridge 运行期间不会自动过期
 - 同一个码可以给多个 iPhone / iPad / Watch 使用
 
-### 5. 编译 App
+### 5. 在 Mac 上启动 Claude Code / Codex
+
+让 bridge 能看到你的 agent session，有两种方式：
+
+#### 方式 A：在 Mac 上用 `claude-watch` / `codex-watch` 启动（推荐）
+
+第 3 步跑完 `./skill/setup-hooks.sh` 之后，脚本会把两个包装命令装到 `~/.local/bin`：
+
+- `claude-watch`：`claude` 的替代命令，启动前会把当前终端注册到 bridge。
+- `codex-watch`：`codex` 的替代命令，额外把 `codex exec` 的事件流桥接过来。
+
+先确保 `~/.local/bin` 在 `PATH` 里：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+验证：
+
+```bash
+which claude-watch
+which codex-watch
+```
+
+**强烈建议放在 tmux 里跑。** bridge 能自动把 `claude-watch` / `codex-watch` 所在的 tmux pane 收养成可持久 session，好处是：
+
+- bridge 重启不丢上下文（可以 kill 掉 `node server.js` 再启一次，session 状态还在）
+- 你可以从任意终端 `tmux attach` 回来，手机 / iPad 继续实时推流
+- 多个 pane 可以被独立跟踪
+
+```bash
+# 一次性创建一个工作 tmux 会话
+tmux new -s dev
+
+# 在 tmux 里启动 agent
+claude-watch                    # Claude Code 交互模式
+codex-watch                     # Codex 交互模式
+codex-watch exec "你的 prompt"    # Codex 一次性执行，事件也会推给 bridge
+
+# Ctrl-b d 分离，后续重连：
+tmux attach -t dev
+```
+
+不用 tmux 也能跑，只是关掉终端窗口 session 就没了。
+
+#### 方式 B：从手机 / iPad 新开 session
+
+如果你人不在 Mac 旁边，可以让 App 去开终端：
+
+1. 先按下一节的步骤把 iPhone / iPad 配对到 bridge
+2. 在首页点 `+` 按钮
+3. 选 `New Claude Window` 或 `New Codex Window`
+4. bridge 会在 Mac 上开一个新的 Terminal.app 窗口，里面的 agent 已经自动桥接好
+
+适合你人已经离开 Mac、临时需要新开一个任务的场景。
+
+### 6. 编译 App
 
 ```bash
 cd ios/ClaudeWatch
@@ -529,13 +586,14 @@ claude-watch/
 
 ## 日常使用流程
 
-1. 在 Mac 上启动 bridge
-2. 在 Mac 上运行 Claude Code 或 Codex
-3. 打开 iPhone App
-4. 用 6 位配对码完成配对
-5. 在手机或手表查看当前 session
-6. 有审批时直接远程处理
-7. 需要时在手表语音发一句跟进提示词，或者在手机 / iPad 输入
+1. 在 Mac 上启动 bridge：`node skill/bridge/server.js`
+2. 在 Mac 上启动 agent，推荐放 tmux 里跑：
+   - `tmux new -s dev && claude-watch`（或 `codex-watch`）
+   - 也可以不在 Mac 上开，后面通过手机 `+` 按钮远程新开
+3. 打开 iPhone App，用 6 位配对码完成配对
+4. 在手机、iPad 或手表查看当前 session
+5. 有审批时直接远程处理
+6. 需要时在手表语音发一句跟进提示词，或者在手机 / iPad 输入
 
 ## 作者
 

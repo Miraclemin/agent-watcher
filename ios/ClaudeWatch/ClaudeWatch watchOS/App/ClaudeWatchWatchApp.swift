@@ -42,6 +42,10 @@ struct ClaudeWatchWatchApp: App {
                 }
             }
             .environmentObject(sessionManager)
+            .sheet(item: $sessionManager.pendingApproval) { request in
+                ApprovalView(request: request)
+                    .environmentObject(sessionManager)
+            }
         }
     }
 
