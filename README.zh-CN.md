@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="./logo.png" width="160" alt="Agent Watcher logo" />
+  <img src="./ios/ClaudeWatch/ClaudeWatch%20iOS/Assets.xcassets/AppLogo.imageset/1.png" width="160" alt="Agent Watcher logo" />
 </p>
 
 <h1 align="center">Agent Watcher</h1>
@@ -537,12 +537,6 @@ claude-watch/
 5. 在手机或手表查看当前 session
 6. 有审批时直接远程处理
 7. 需要时在手表语音发一句跟进提示词，或者在手机 / iPad 输入
-
-## 致谢
-
-本项目受到原始 `claude-watch` 项目的启发：
-
-- https://github.com/shobhit99/claude-watch
 
 ## 作者
 

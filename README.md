@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="./logo.png" width="160" alt="Agent Watcher logo" />
+  <img src="./ios/ClaudeWatch/ClaudeWatch%20iOS/Assets.xcassets/AppLogo.imageset/1.png" width="160" alt="Agent Watcher logo" />
 </p>
 
 <h1 align="center">Agent Watcher</h1>
@@ -522,12 +522,6 @@ claude-watch/
 5. Check the current session on phone or watch.
 6. Approve or deny actions remotely when needed.
 7. Dictate a short follow-up prompt from the watch or type from phone / iPad.
-
-## Credits
-
-Inspired by the original `claude-watch` project:
-
-- https://github.com/shobhit99/claude-watch
 
 ## Author
 
