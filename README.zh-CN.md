@@ -546,6 +546,12 @@ claude-watch/
 
 - https://github.com/Miraclemin
 
+## 致谢
+
+本项目由 Hanmin Wang 独立维护，并参考了更早的 `claude-watch` 项目作为灵感来源：
+
+- https://github.com/shobhit99/claude-watch
+
 ## 开源协议
 
 本项目使用 MIT License，详见 [LICENSE](./LICENSE)。

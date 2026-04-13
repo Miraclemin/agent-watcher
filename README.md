@@ -531,6 +531,12 @@ GitHub profile used in the current workspace:
 
 - https://github.com/Miraclemin
 
+## Credits
+
+This project is independently maintained by Hanmin Wang and references the earlier `claude-watch` project for inspiration:
+
+- https://github.com/shobhit99/claude-watch
+
 ## License
 
 This project is released under the MIT License. See [LICENSE](./LICENSE).
