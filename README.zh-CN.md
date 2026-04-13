@@ -524,7 +524,6 @@ claude-watch/
 │   ├── ClaudeWatch iPad/
 │   ├── ClaudeWatch watchOS/
 │   └── Shared/
-├── logo.png
 └── README.md
 ```
 
