@@ -8,7 +8,7 @@ struct PairingView: View {
 
     @State private var code: String = ""
     @State private var ipAddress: String = ""
-    @State private var showManualIP: Bool = false
+    @State private var manualConnectionMode: ManualConnectionMode = .local
     @FocusState private var isCodeFocused: Bool
     @FocusState private var isIPFocused: Bool
     @State private var shakeOffset: CGFloat = 0
@@ -20,16 +20,12 @@ struct PairingView: View {
     @State private var cfClientId: String = UserDefaults.standard.string(forKey: "cf_client_id") ?? ""
     @State private var cfClientSecret: String = UserDefaults.standard.string(forKey: "cf_client_secret") ?? ""
 
-    private var trimmedBridgeAddress: String {
-        ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     private var showsCloudflareSection: Bool {
-        BridgeClient.inputRequiresCloudflareAccess(trimmedBridgeAddress)
+        manualConnectionMode == .remote
     }
 
     private var usesDirectPrivateLink: Bool {
-        BridgeClient.inputUsesDirectPrivateLink(trimmedBridgeAddress)
+        manualConnectionMode == .direct
     }
 
     // MARK: - Body
@@ -43,13 +39,13 @@ struct PairingView: View {
 
                 mascotIcon
                 titleSection
+                manualModePicker
+                connectionModeHints
+                modeDescriptionSection
+                ipEntrySection
 
-                if showManualIP {
-                    ipEntrySection
-
-                    if showsCloudflareSection {
-                        cloudflareSection
-                    }
+                if showsCloudflareSection {
+                    cloudflareSection
                 }
 
                 digitFields
@@ -74,9 +70,7 @@ struct PairingView: View {
                 .font(.system(size: 28, weight: .bold))
                 .foregroundStyle(Color.claudeOrange)
 
-            Text(showManualIP
-                 ? "Enter your Mac's IP, Tailscale host, or bridge URL"
-                 : "Enter the pairing code from your Mac")
+            Text("Choose how your iPhone reaches the bridge, then enter the 6-digit pairing code from your Mac.")
                 .font(.system(size: 15))
                 .foregroundStyle(Color.subtleText)
                 .multilineTextAlignment(.center)
@@ -85,8 +79,8 @@ struct PairingView: View {
 
     private var ipEntrySection: some View {
         HStack(spacing: 8) {
-            TextField("192.168.1.x, 100.x.y.z, my-mac.ts.net, or watch.example.com", text: $ipAddress)
-                .keyboardType(.URL)
+            TextField(manualConnectionMode.placeholder, text: $ipAddress)
+                .keyboardType(manualConnectionMode == .local ? .numbersAndPunctuation : .URL)
                 .autocorrectionDisabled()
                 .font(.system(size: 17, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
@@ -102,6 +96,62 @@ struct PairingView: View {
                 )
                 .focused($isIPFocused)
         }
+    }
+
+    private var modeDescriptionSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(manualConnectionMode.summaryTitle)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.claudeOrange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(manualConnectionMode.summaryBody)
+                .font(.system(size: 12))
+                .foregroundStyle(Color.subtleText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if manualConnectionMode == .local {
+                Text("Leave the address blank to auto-discover on the same Wi-Fi, or enter a LAN IP manually.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.subtleText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(14)
+        .background(Color.cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.fieldBorder, lineWidth: 1)
+        )
+    }
+
+    private var connectionModeHints: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(ManualConnectionMode.allCases) { mode in
+                HStack(alignment: .top, spacing: 8) {
+                    Circle()
+                        .fill(mode == manualConnectionMode ? Color.claudeOrange : Color.fieldBorder)
+                        .frame(width: 6, height: 6)
+                        .padding(.top, 5)
+
+                    Text("\(mode.title): \(mode.shortHint)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(mode == manualConnectionMode ? .white : Color.subtleText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var manualModePicker: some View {
+        Picker("Connection Type", selection: $manualConnectionMode) {
+            ForEach(ManualConnectionMode.allCases) { mode in
+                Text(mode.title).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
     }
 
     private var cloudflareSection: some View {
@@ -183,9 +233,7 @@ struct PairingView: View {
             }
         }
         .onAppear {
-            if !showManualIP {
-                isCodeFocused = true
-            }
+            isCodeFocused = true
         }
     }
 
@@ -219,24 +267,11 @@ struct PairingView: View {
 
     private var bottomSection: some View {
         VStack(spacing: 12) {
-            if showManualIP && usesDirectPrivateLink {
+            if usesDirectPrivateLink {
                 Text("Direct private bridge detected. Tailscale and private IP addresses connect without Cloudflare Access.")
                     .font(.system(size: 12))
                     .foregroundStyle(Color.subtleText)
                     .multilineTextAlignment(.center)
-            }
-
-            if !showManualIP {
-                Button {
-                    withAnimation {
-                        showManualIP = true
-                        isIPFocused = true
-                    }
-                } label: {
-                    Text("Can't connect? Enter IP manually")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.claudeOrange)
-                }
             }
 
             Text("Run `node server.js` in the bridge folder to start")
@@ -283,27 +318,38 @@ struct PairingView: View {
 
         Task {
             do {
-                if showManualIP {
-                    let input = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !input.isEmpty else {
-                        await MainActor.run {
-                            showPairingError("Please enter your Mac's IP, Tailscale host, or bridge URL.")
-                        }
-                        return
-                    }
+                let input = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                    if BridgeClient.inputRequiresCloudflareAccess(input) {
-                        saveCFCredentials()
-                    }
-
-                    if BridgeClient.inputUsesDirectPrivateLink(input),
-                       input.allSatisfy({ $0.isNumber || $0 == "." }) {
+                switch manualConnectionMode {
+                case .local:
+                    if input.isEmpty {
+                        try await relayService.pair(code: code)
+                    } else if input.allSatisfy({ $0.isNumber || $0 == "." }) {
                         try await relayService.pairWithIP(input, code: code)
                     } else {
                         try await relayService.pairWithURL(input, code: code)
                     }
-                } else {
-                    try await relayService.pair(code: code)
+                case .direct:
+                    guard !input.isEmpty else {
+                        await MainActor.run {
+                            showPairingError("Enter your Tailscale/private address first, then try the pairing code again.")
+                        }
+                        return
+                    }
+                    if input.allSatisfy({ $0.isNumber || $0 == "." }) {
+                        try await relayService.pairWithIP(input, code: code)
+                    } else {
+                        try await relayService.pairWithURL(input, code: code)
+                    }
+                case .remote:
+                    guard !input.isEmpty else {
+                        await MainActor.run {
+                            showPairingError("Enter your Cloudflare bridge domain first, then try the pairing code again.")
+                        }
+                        return
+                    }
+                    saveCFCredentials()
+                    try await relayService.pairWithURL(input, code: code)
                 }
             } catch let error as BridgeClient.BridgeError {
                 await MainActor.run { handlePairingError(error) }
@@ -312,8 +358,8 @@ struct PairingView: View {
                     let msg = error.localizedDescription
                     // If auto-discovery failed, suggest manual IP
                     if msg.contains("noServiceFound") || msg.contains("timed out") || msg.contains("not found") {
-                        showManualIP = true
-                        showPairingError("Bridge not found automatically. Enter your Mac's IP, Tailscale host, or bridge URL.")
+                        manualConnectionMode = .local
+                        showPairingError("Local auto-discovery failed. Enter the LAN address manually, or switch to Direct / Cloudflare.")
                         isIPFocused = true
                     } else {
                         showPairingError("Connection failed: \(msg)")
@@ -335,13 +381,8 @@ struct PairingView: View {
         case .unauthorized:
             showPairingError("Bridge session expired. Restart the bridge if needed, then pair again with the new 6-digit code.")
         case .networkError:
-            if !showManualIP {
-                showManualIP = true
-                showPairingError("Can't reach bridge. Enter your Mac's IP, Tailscale host, or bridge URL.")
-                isIPFocused = true
-            } else {
-                showPairingError("Cannot reach the bridge server. Check the address and network.")
-            }
+            showPairingError("Cannot reach the bridge server. Check the selected mode, address, and network.")
+            isIPFocused = true
         case .serverError(let msg):
             showPairingError(msg)
         }
@@ -355,7 +396,7 @@ struct PairingView: View {
         }
         code = ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if showManualIP && ipAddress.isEmpty {
+            if ipAddress.isEmpty && manualConnectionMode != .local {
                 isIPFocused = true
             } else {
                 isCodeFocused = true
@@ -379,6 +420,66 @@ struct PairingView: View {
         UserDefaults.standard.set(id, forKey: "cf_client_id")
         UserDefaults.standard.set(secret, forKey: "cf_client_secret")
         WatchSessionManager.shared.syncCloudflareCredentials(clientId: id, clientSecret: secret)
+    }
+}
+
+private enum ManualConnectionMode: String, CaseIterable, Identifiable {
+    case local
+    case direct
+    case remote
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .local: return "Local IP"
+        case .direct: return "Direct"
+        case .remote: return "Cloudflare"
+        }
+    }
+
+    var summaryTitle: String {
+        switch self {
+        case .local:
+            return "Local IP: same Wi-Fi / hotspot"
+        case .direct:
+            return "Direct: Tailscale or other private network"
+        case .remote:
+            return "Cloudflare: public HTTPS tunnel"
+        }
+    }
+
+    var summaryBody: String {
+        switch self {
+        case .local:
+            return "Use this when your phone can reach the Mac on the same local network. Lowest setup cost."
+        case .direct:
+            return "Use a private address like 100.x.y.z or MagicDNS. Best for remote low latency without public proxying."
+        case .remote:
+            return "Use your public bridge domain when you need Internet access from anywhere. Cloudflare Access credentials may be required."
+        }
+    }
+
+    var placeholder: String {
+        switch self {
+        case .local:
+            return "Optional: 192.168.1.x or local hostname"
+        case .direct:
+            return "100.x.y.z or your-mac.ts.net"
+        case .remote:
+            return "https://watch.example.com"
+        }
+    }
+
+    var shortHint: String {
+        switch self {
+        case .local:
+            return "same Wi-Fi, fastest to set up"
+        case .direct:
+            return "Tailscale/private network, best remote latency"
+        case .remote:
+            return "public domain through Cloudflare tunnel"
+        }
     }
 }
 

@@ -40,12 +40,64 @@ final class WatchViewState: ObservableObject {
             }
         }
 
+        sessionManager.onBridgeCredentialsReceived = { [weak self] credentials in
+            DispatchQueue.main.async {
+                self?.applyBridgeCredentials(credentials)
+            }
+        }
+
         requestCompanionSync()
     }
 
     func requestCompanionSync() {
         isReachable = sessionManager.isReachable
+        sessionManager.requestBridgeCredentialsSync()
         sessionManager.requestRelaySnapshot()
+        if WatchBridgeClient.shared.isPaired {
+            Task {
+                await self.refreshBridgeSnapshotFromWatch()
+            }
+        }
+    }
+
+    private func applyBridgeCredentials(_ credentials: WatchSessionManager.BridgeCredentialsSync) {
+        if credentials.cleared {
+            WatchBridgeClient.shared.unpair()
+            sessionState.machineName = nil
+            sessions = []
+            refreshDerivedState()
+            return
+        }
+
+        guard let baseURL = credentials.baseURL, let token = credentials.token else { return }
+        WatchBridgeClient.shared.applyPairedCredentials(baseURL: baseURL, token: token)
+        if let machineName = credentials.machineName {
+            sessionState.machineName = machineName
+        }
+        refreshDerivedState()
+        sessionManager.requestRelaySnapshot()
+        Task {
+            await self.refreshBridgeSnapshotFromWatch()
+        }
+    }
+
+    @MainActor
+    private func refreshBridgeSnapshotFromWatch() async {
+        guard WatchBridgeClient.shared.isPaired else { return }
+        do {
+            let status = try await WatchBridgeClient.shared.fetchStatus()
+            sessionState.connection = (status.state == "connected" || status.state == "idle")
+                ? .connected
+                : .disconnected
+            if let snapshot = status.sessions, !snapshot.isEmpty {
+                applySessionSnapshot(snapshot)
+            } else {
+                refreshDerivedState()
+            }
+        } catch {
+            print("[WatchViewState] Failed to refresh bridge snapshot directly: \(error)")
+            refreshDerivedState()
+        }
     }
 
     func appendLine(_ line: TerminalLine, sessionId: String? = nil) {
@@ -188,7 +240,8 @@ final class WatchViewState: ObservableObject {
             $0.activity == .running || $0.activity == .waitingApproval || !$0.terminalLines.isEmpty
         })
 
-        isPaired = sessionState.machineName != nil
+        isPaired = WatchBridgeClient.shared.isPaired
+            || sessionState.machineName != nil
             || sessionState.connection != .disconnected
             || !sessions.isEmpty
     }

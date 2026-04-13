@@ -69,6 +69,7 @@ final class SSEClient {
     func connect(baseURL: URL, token: String, preferPolling: Bool = false) {
         self.baseURL = baseURL
         self.token = token
+        debug("connect url=\(baseURL.absoluteString) preferPolling=\(preferPolling)")
         if preferPolling {
             stopSSE()
             startPolling()
@@ -78,6 +79,7 @@ final class SSEClient {
     }
 
     func disconnect() {
+        debug("disconnect")
         stopSSE()
         stopPolling()
         state = .disconnected
@@ -101,6 +103,8 @@ final class SSEClient {
         if let lastEventId {
             request.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID")
         }
+
+        debug("startSSE url=\(eventsURL.absoluteString) lastEventId=\(lastEventId ?? "none")")
 
         let delegate = SSESessionDelegate(client: self)
         self.sessionDelegate = delegate
@@ -149,6 +153,7 @@ final class SSEClient {
 
     private func handleHeartbeatTimeout() {
         // No data received within the heartbeat window -- reconnect
+        debug("heartbeat-timeout")
         recordSSEFailure()
         reconnectOrFallback()
     }
@@ -172,9 +177,11 @@ final class SSEClient {
         stopSSE()
 
         if shouldFallbackToPolling() {
+            debug("fallback-to-polling failures=\(sseFailures.count)")
             startPolling()
         } else {
             // Reconnect SSE after a brief delay
+            debug("reconnect-sse failures=\(sseFailures.count)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 self?.startSSE()
             }
@@ -186,6 +193,7 @@ final class SSEClient {
     private func startPolling() {
         stopPolling()
         state = .polling
+        debug("startPolling interval=\(pollingInterval)s")
 
         pollingTimer = Timer.scheduledTimer(
             withTimeInterval: pollingInterval,
@@ -221,6 +229,7 @@ final class SSEClient {
             }
 
             if (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil {
+                self.debug("poll-status bytes=\(data.count)")
                 let event = SSEEvent(
                     id: nil,
                     event: "poll-status",
@@ -238,6 +247,7 @@ final class SSEClient {
 
     fileprivate func handleSSEConnected() {
         DispatchQueue.main.async {
+            self.debug("connected")
             self.state = .connected
         }
     }
@@ -322,13 +332,19 @@ final class SSEClient {
     }
 
     fileprivate func handleSSEError(_ error: Error?) {
+        debug("error \(error?.localizedDescription ?? "unknown")")
         recordSSEFailure()
         reconnectOrFallback()
     }
 
     fileprivate func handleSSEComplete() {
         // Stream ended gracefully -- reconnect
+        debug("complete")
         reconnectOrFallback()
+    }
+
+    private func debug(_ message: String) {
+        print("[SSEClient] \(message)")
     }
 }
 
@@ -355,6 +371,9 @@ private final class SSESessionDelegate: NSObject, URLSessionDataDelegate {
             client?.handleAuthRejected()
             completionHandler(.cancel)
         } else {
+            if let httpResponse = response as? HTTPURLResponse {
+                print("[SSEClient] unexpected-response status=\(httpResponse.statusCode)")
+            }
             client?.handleSSEError(nil)
             completionHandler(.cancel)
         }

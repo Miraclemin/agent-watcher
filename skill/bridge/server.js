@@ -83,7 +83,6 @@ if (TMUX_BIN) {
 
 const PORT_RANGE_START = 7860;
 const PORT_RANGE_END = 7869;
-const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const SSE_HEARTBEAT_INTERVAL_MS = 2_000;
@@ -121,7 +120,6 @@ const BRIDGE_ID = crypto.randomUUID();
 
 const sessionTokens = new Set();
 let pairingCode = null;
-let pairingCodeExpiresAt = 0;
 
 // Rate limiting
 let rateLimitAttempts = 0;
@@ -173,6 +171,8 @@ const externalSessionAliases = new Map();
 const codexSyntheticPermissions = new Map();
 /** @type {Map<string, string>} */
 const codexSyntheticPermissionBySession = new Map();
+/** @type {Map<string, {startedAt: number, commandPreview: string, chars: number, source: string}>} */
+const pendingCommandDiagnostics = new Map();
 /** Track recently resolved approval sessions so the log-file path doesn't re-surface them */
 const codexRecentlyResolvedApprovals = new Map(); // sessionId → timestamp
 const CODEX_RESOLVED_APPROVAL_TTL_MS = 60_000; // 60 seconds
@@ -192,12 +192,55 @@ let bonjourService = null;
 // Helpers
 // ---------------------------------------------------------------------------
 
-function generatePairingCode() {
-  const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
-  pairingCode = code;
-  pairingCodeExpiresAt = Date.now() + PAIRING_CODE_TTL_MS;
-  log("info", `Pairing code generated: ${code} (expires in 5 minutes)`);
-  return code;
+function isValidPairingCode(value) {
+  return typeof value === "string" && /^\d{6}$/.test(value.trim());
+}
+
+function getConfiguredPairingCode() {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--pairing-code" && argv[i + 1]) {
+      return argv[i + 1].trim();
+    }
+    if (arg.startsWith("--pairing-code=")) {
+      return arg.slice("--pairing-code=".length).trim();
+    }
+  }
+  return (process.env.PAIRING_CODE || "").trim();
+}
+
+function getDefaultSessionCwd() {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--pairing-code") {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--pairing-code=")) {
+      continue;
+    }
+    return arg;
+  }
+  return null;
+}
+
+function initializePairingCode() {
+  const configuredCode = getConfiguredPairingCode();
+  if (configuredCode) {
+    if (!isValidPairingCode(configuredCode)) {
+      log("error", `Invalid pairing code "${configuredCode}". Expected exactly 6 digits.`);
+      process.exit(1);
+    }
+    pairingCode = configuredCode;
+    log("info", `Using configured persistent pairing code: ${pairingCode}`);
+    return pairingCode;
+  }
+
+  pairingCode = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
+  log("info", `Generated persistent pairing code: ${pairingCode}`);
+  return pairingCode;
 }
 
 function generateSessionToken() {
@@ -222,6 +265,41 @@ function recordRateLimitAttempt() {
     rateLimitWindowStart = now;
   }
   rateLimitAttempts++;
+}
+
+function summarizeCommandText(text, maxLength = 80) {
+  const normalized = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "";
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized;
+}
+
+function beginCommandDiagnostic(sessionId, command, source = "command") {
+  if (!sessionId || typeof command !== "string") return;
+  pendingCommandDiagnostics.set(sessionId, {
+    startedAt: Date.now(),
+    commandPreview: summarizeCommandText(command),
+    chars: command.length,
+    source,
+  });
+}
+
+function resolveCommandDiagnostic(sessionId, event, payload) {
+  if (!sessionId) return;
+  const pending = pendingCommandDiagnostics.get(sessionId);
+  if (!pending) return;
+  if (event === "conversation-message" && payload?.role === "user") return;
+
+  const text = typeof payload?.text === "string" ? payload.text.trim() : "";
+  if (!text) return;
+
+  pendingCommandDiagnostics.delete(sessionId);
+  const elapsedMs = Date.now() - pending.startedAt;
+  log(
+    "info",
+    `[diag] first-event session=${sessionId} source=${pending.source} event=${event} latencyMs=${elapsedMs} chars=${pending.chars} command="${pending.commandPreview}"`
+  );
 }
 
 function requireAuth(req) {
@@ -1903,6 +1981,10 @@ function pushSseEvent(event, data, sessionId = null) {
     }
   }
 
+  if (sessionId !== null && (event === "pty-output" || event === "conversation-message")) {
+    resolveCommandDiagnostic(sessionId, event, payload);
+  }
+
   const entry = { id: sseEventId, event, data: JSON.stringify(payload) };
   appendSessionReplayEvent(sessionId, event, payload);
 
@@ -2729,7 +2811,8 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
     ? CLAUDE_SESSION_BOOTSTRAP_LOOKBACK_MS
     : CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS;
   const sessionIsRecent = effectiveCreatedAt && (Date.now() - effectiveCreatedAt) <= recencyWindowMs;
-  if (!managedSlot && !liveProcess && !sessionIsRecent && !resumeSessionId) {
+  const allowFileOnlyBootstrap = agent === "codex" && sessionIsRecent;
+  if (!managedSlot && !liveProcess && !allowFileOnlyBootstrap && !resumeSessionId) {
     return null;
   }
   const canonicalSessionId = managedSlot?.id
@@ -2865,16 +2948,26 @@ function touchExternalSession(sessionId, cwd, createdAt, agent = "codex", extra 
 function endExternalSession(sessionId, reason = "codex-exit") {
   const canonicalSessionId = getCanonicalSessionId(sessionId);
   const slot = sessions.get(canonicalSessionId);
-  if (!slot || slot.state === "ended") return;
-  slot.state = "ended";
+  if (!slot || slot.state === "removed") return;
+  slot.state = "removed";
   slot.ptyProcess = null;
   queuedPrompts.delete(slot.id);
+  claudeSessionFiles.delete(slot.id);
+  unregisterTmuxLogFile(slot);
+  sessionReplayBuffers.delete(slot.id);
   clearCodexSyntheticPermissionForSession(slot.id, reason);
   if (sessionId && sessionId !== slot.id) {
     externalSessionAliases.delete(sessionId);
   }
-  pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, reason }, slot.id);
-  log("info", `Marked external session ${slot.id} as ended (${reason})`);
+  for (const [alias, target] of externalSessionAliases.entries()) {
+    if (target === slot.id || alias === slot.externalSessionId) {
+      externalSessionAliases.delete(alias);
+    }
+  }
+  cleanupTmuxFiles(slot);
+  sessions.delete(slot.id);
+  pushSseEvent("session-removed", { agent: slot.agent, folderName: slot.folderName, reason }, slot.id);
+  log("info", `Removed external session ${slot.id} (${reason})`);
 }
 
 function parseJsonLine(line) {
@@ -3602,7 +3695,7 @@ function dispatchCommandToSession(targetSession, command, agent = "claude", cwd 
 
   if (!slot) {
     const requestedAgent = agent || "claude";
-    const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
+    const resolvedCwd = cwd || getDefaultSessionCwd() || process.env.HOME || process.cwd();
     const newId = spawnSession(requestedAgent, resolvedCwd);
     if (!newId) {
       return { ok: false, status: 500, error: `Failed to spawn ${requestedAgent}` };
@@ -3614,6 +3707,14 @@ function dispatchCommandToSession(targetSession, command, agent = "claude", cwd 
       }
     }, 500);
     return { ok: true, sessionId: newId, agent: requestedAgent, spawned: true };
+  }
+
+  if (slot.state === "ended" || slot.state === "removed") {
+    return {
+      ok: false,
+      status: 410,
+      error: "This session has exited on your Mac and can no longer receive messages. Start or reopen a session on Mac, then try again.",
+    };
   }
 
   if (slot.backend === "tmux") {
@@ -3790,19 +3891,12 @@ async function handlePair(req, res) {
     return jsonResponse(res, 400, { error: "Missing 'code' field" });
   }
 
-  if (Date.now() > pairingCodeExpiresAt) {
-    generatePairingCode();
-    return jsonResponse(res, 401, { error: "Pairing code expired. A new code has been generated." });
-  }
-
   if (code !== pairingCode) {
     return jsonResponse(res, 401, { error: "Invalid pairing code" });
   }
 
   // Success
   const token = generateSessionToken();
-  pairingCode = null;
-  pairingCodeExpiresAt = 0;
   bridgeState = "connected";
   pushSseEvent("session", { state: "connected" });
 
@@ -3860,7 +3954,7 @@ async function handleCommand(req, res) {
     if (!validAgents.includes(spawnRequest)) {
       return jsonResponse(res, 400, { error: `Invalid agent: ${spawnRequest}. Use: ${validAgents.join(", ")}` });
     }
-    const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+    const cwd = body.cwd || getDefaultSessionCwd() || process.env.HOME || process.cwd();
     const newId = spawnSession(spawnRequest, cwd, { managedDesktop: openDesktopWindow === true });
     if (!newId) {
       return jsonResponse(res, 500, { error: `Failed to spawn ${spawnRequest}` });
@@ -3987,7 +4081,9 @@ async function handleCommand(req, res) {
     if (resolvedSessionId) {
       targetSession = sessions.get(resolvedSessionId);
       if (!targetSession) {
-        return jsonResponse(res, 404, { error: "No session with that ID" });
+        return jsonResponse(res, 410, {
+          error: "This session has exited on your Mac and can no longer receive messages. Refresh sessions and start a new one.",
+        });
       }
     } else {
       targetSession = findMostRecentActiveSession() || findMostRecentRunningSession();
@@ -4002,10 +4098,17 @@ async function handleCommand(req, res) {
       targetSession,
       command,
       agent || "claude",
-      body.cwd || process.argv[2] || process.env.HOME || process.cwd()
+      body.cwd || getDefaultSessionCwd() || process.env.HOME || process.cwd()
     );
     if (!result.ok) {
       return jsonResponse(res, result.status || 500, { error: result.error || "Request failed" });
+    }
+    if (result.sessionId) {
+      beginCommandDiagnostic(result.sessionId, command, result.spawned ? "spawn" : "command");
+      log(
+        "info",
+        `[diag] command-accepted session=${result.sessionId} spawned=${Boolean(result.spawned)} backend=${targetSession?.backend || "spawn"} chars=${String(command).length}`
+      );
     }
     return jsonResponse(res, 200, result);
   }
@@ -4071,7 +4174,10 @@ function handleEvents(req, res) {
   }
 
   sseClients.add(res);
-  log("info", `SSE client connected (total: ${sseClients.size})`);
+  log(
+    "info",
+    `SSE client connected (total: ${sseClients.size}) lastEventId=${lastIdHeader || "none"} bootstrap=${shouldBootstrapFresh}`
+  );
 
   // Bootstrap fresh clients with the current session list plus recent per-session context.
   if (shouldBootstrapFresh) {
@@ -4160,7 +4266,7 @@ function resolveHookSession(body) {
   const source = body.source || "claude";
   const agent = source === "codex" ? "codex" : "claude";
   const hookSessionId = body.session_id || body.sessionId || body.claude_session_id || null;
-  const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
+  const resolvedCwd = cwd || getDefaultSessionCwd() || process.env.HOME || process.cwd();
 
   if (hookSessionId) {
     const canonicalSessionId = getCanonicalSessionId(hookSessionId);
@@ -4506,7 +4612,7 @@ async function startServer() {
 
   log("info", `Bridge server listening on 0.0.0.0:${boundPort}`);
 
-  const code = generatePairingCode();
+  const code = initializePairingCode();
 
   // Bonjour
   bonjourInstance = new Bonjour();

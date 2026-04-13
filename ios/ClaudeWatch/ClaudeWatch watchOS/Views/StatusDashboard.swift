@@ -19,7 +19,7 @@ struct StatusDashboard: View {
                         Text(taskSummary)
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundColor(Theme.Text.primary)
-                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 

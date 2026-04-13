@@ -44,7 +44,7 @@ struct ApprovalView: View {
                     Text(request.actionSummary)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(Theme.Accent.approval)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Divider().background(Theme.Text.dimmed)
@@ -63,13 +63,13 @@ struct ApprovalView: View {
                                 Text(option.label)
                                     .font(.system(size: 12, weight: .semibold))
                                     .foregroundColor(.white)
-                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
 
                                 if let desc = option.description, !desc.isEmpty {
                                     Text(desc)
                                         .font(.system(size: 10))
                                         .foregroundColor(Theme.Text.secondary)
-                                        .lineLimit(2)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
 

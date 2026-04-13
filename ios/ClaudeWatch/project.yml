@@ -1,6 +1,6 @@
 name: ClaudeWatch
 options:
-  bundleIdPrefix: com.shobhit.claudewatch
+  bundleIdPrefix: com.nightwatcherphone.han
   deploymentTarget:
     iOS: "17.0"
     watchOS: "10.0"
@@ -10,6 +10,8 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     ONLY_ACTIVE_ARCH: true
+    DEVELOPMENT_TEAM: SF9F57P2JZ
+    CODE_SIGN_STYLE: Automatic
 
 targets:
   ClaudeWatch:
@@ -20,7 +22,7 @@ targets:
       - path: Shared
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.shobhit.claudewatch
+        PRODUCT_BUNDLE_IDENTIFIER: com.nightwatcherphone.han
         INFOPLIST_FILE: "ClaudeWatch iOS/Info.plist"
         PRODUCT_NAME: Agent Watcher
         GENERATE_INFOPLIST_FILE: false
@@ -36,13 +38,36 @@ targets:
       - path: Shared
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.shobhit.claudewatch.watchkitapp
+        PRODUCT_BUNDLE_IDENTIFIER: com.nightwatcherphone.han.watchkitapp
         INFOPLIST_FILE: "ClaudeWatch watchOS/Info.plist"
         PRODUCT_NAME: Agent Watcher
         GENERATE_INFOPLIST_FILE: false
         SUPPORTS_MACCATALYST: false
         ARCHS: "arm64 arm64e arm64_32"
         "EXCLUDED_ARCHS[sdk=watchsimulator*]": arm64e
+
+  # iPad app — parallel to iPhone, does NOT embed watchOS.
+  # Reuses iPhone's Networking/Services/Pairing/Settings verbatim so approval
+  # and session-ownership logic is byte-identical. Watch stays paired to iPhone.
+  ClaudeWatchPad:
+    type: application
+    platform: iOS
+    sources:
+      - path: "ClaudeWatch iPad"
+      - path: "ClaudeWatch iOS/Networking"
+      - path: "ClaudeWatch iOS/Services"
+      - path: "ClaudeWatch iOS/Views/PairingView.swift"
+      - path: "ClaudeWatch iOS/Views/SettingsView.swift"
+      - path: "ClaudeWatch iOS/Assets.xcassets"
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.han.agentwatch.ipad
+        INFOPLIST_FILE: "ClaudeWatch iPad/Info.plist"
+        PRODUCT_NAME: Agent Watcher Pad
+        GENERATE_INFOPLIST_FILE: false
+        TARGETED_DEVICE_FAMILY: "2"
+        SUPPORTS_MACCATALYST: false
 
 schemes:
   ClaudeWatch:
@@ -59,3 +84,9 @@ schemes:
     run:
       config: Debug
       executable: ClaudeWatchWatch
+  ClaudeWatchPad:
+    build:
+      targets:
+        ClaudeWatchPad: all
+    run:
+      config: Debug

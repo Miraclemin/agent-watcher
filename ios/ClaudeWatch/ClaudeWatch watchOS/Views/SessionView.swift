@@ -1,12 +1,10 @@
 import SwiftUI
-import WatchKit
 
 struct SessionView: View {
     let sessionIndex: Int
     @EnvironmentObject private var session: WatchViewState
 
     @State private var cursorVisible = true
-    @State private var showVoiceInput = false
     private let cursorTimer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
 
     private var agentSession: AgentSession {
@@ -17,8 +15,7 @@ struct SessionView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            VStack(spacing: 0) {
+        VStack(spacing: 0) {
                 // Top bar — agent icon + folder name
                 HStack(spacing: 4) {
                     AgentIcon(agent: agentSession.agent, size: 14)
@@ -67,7 +64,6 @@ struct SessionView: View {
                                     .id("cursor")
                             }
 
-                            Spacer().frame(height: 46)
                         }
                         .padding(.horizontal, 4)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -82,34 +78,10 @@ struct SessionView: View {
                         }
                     }
                 }
-            }
-
-            Button {
-                guard micEnabled else { return }
-                WKInterfaceDevice.current().play(.click)
-                showVoiceInput = true
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(micEnabled ? Theme.Text.primary.opacity(0.9) : Theme.Text.secondary.opacity(0.45))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: 18, weight: .bold))
-                        .foregroundColor(.black.opacity(micEnabled ? 1 : 0.55))
-                }
-                .contentShape(Circle())
-                .shadow(color: .black.opacity(0.45), radius: 6, y: 3)
-            }
-            .buttonStyle(.plain)
-            .disabled(!micEnabled)
-            .padding(.bottom, 8)
         }
         .background(Theme.Background.primary)
         .sheet(item: $session.pendingApproval) { request in
             ApprovalView(request: request)
-        }
-        .sheet(isPresented: $showVoiceInput) {
-            VoiceInputView(sessionId: agentSession.id)
         }
     }
 
@@ -125,9 +97,8 @@ struct SessionView: View {
         Text(line.text)
             .font(.system(size: 11, design: .monospaced))
             .foregroundColor(colorForLine(line))
-            .lineLimit(4)
-            .truncationMode(.tail)
             .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func colorForLine(_ line: TerminalLine) -> Color {
@@ -135,17 +106,6 @@ struct SessionView: View {
             return Theme.Accent.success
         }
         return colorFor(line.type)
-    }
-
-    private var micEnabled: Bool {
-        if agentSession.activity == .ended { return false }
-        // Allow mic for Codex inline approvals (user says 'y'/'n')
-        if agentSession.agent == .codex
-            && agentSession.activity == .waitingApproval
-            && agentSession.pendingApproval != nil {
-            return true
-        }
-        return agentSession.activity != .waitingApproval
     }
 
     private var isThinking: Bool {

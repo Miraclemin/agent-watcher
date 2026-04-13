@@ -55,6 +55,14 @@ final class RelayService: ObservableObject {
     private var isAppActive = true
 
     private var cancellables = Set<AnyCancellable>()
+    private var pendingCommandTracesBySession: [String: PendingCommandTrace] = [:]
+    private var pendingGlobalCommandTrace: PendingCommandTrace?
+
+    private struct PendingCommandTrace {
+        let sentAt: Date
+        let preview: String
+        let transport: String
+    }
 
     // MARK: - Init
 
@@ -186,6 +194,8 @@ final class RelayService: ObservableObject {
         stopHeartbeatTimer()
         terminalBatchTimer?.invalidate()
         terminalBatchTimer = nil
+        pendingCommandTracesBySession.removeAll()
+        pendingGlobalCommandTrace = nil
 
         isPaired = false
         machineName = nil
@@ -251,6 +261,7 @@ final class RelayService: ObservableObject {
 
         sseClient.onStateChange = { [weak self] state in
             Task { @MainActor in
+                print("[RelayService][Trace] stream-state=\(String(describing: state)) transport=\(self?.bridgeClient.transportMode.rawValue.uppercased() ?? "UNKNOWN")")
                 switch state {
                 case .connected:
                     self?.connectionState = .connected
@@ -360,6 +371,70 @@ final class RelayService: ObservableObject {
         }
     }
 
+    private func recordPendingCommandTrace(sessionId: String?, text: String) {
+        let trace = PendingCommandTrace(
+            sentAt: Date(),
+            preview: summarizeTraceText(text),
+            transport: bridgeClient.transportMode.rawValue.uppercased()
+        )
+
+        if let sessionId, !sessionId.isEmpty {
+            pendingCommandTracesBySession[sessionId] = trace
+        } else {
+            pendingGlobalCommandTrace = trace
+        }
+
+        print("[RelayService][Trace] send transport=\(trace.transport) session=\(sessionId ?? "none") chars=\(text.count) preview=\"\(trace.preview)\"")
+    }
+
+    private func movePendingCommandTrace(from oldSessionId: String?, to newSessionId: String?) {
+        guard let newSessionId, !newSessionId.isEmpty else { return }
+
+        if let oldSessionId,
+           let trace = pendingCommandTracesBySession.removeValue(forKey: oldSessionId) {
+            pendingCommandTracesBySession[newSessionId] = trace
+            return
+        }
+
+        if let trace = pendingGlobalCommandTrace {
+            pendingGlobalCommandTrace = nil
+            pendingCommandTracesBySession[newSessionId] = trace
+        }
+    }
+
+    private func clearPendingCommandTrace(sessionId: String?) {
+        if let sessionId, !sessionId.isEmpty {
+            pendingCommandTracesBySession.removeValue(forKey: sessionId)
+        } else {
+            pendingGlobalCommandTrace = nil
+        }
+    }
+
+    private func logFirstResponseIfNeeded(sessionId: String?, event: String) {
+        let trace: PendingCommandTrace?
+        if let sessionId, let matched = pendingCommandTracesBySession.removeValue(forKey: sessionId) {
+            trace = matched
+        } else {
+            trace = pendingGlobalCommandTrace
+            pendingGlobalCommandTrace = nil
+        }
+
+        guard let trace else { return }
+        let latencyMs = Int(Date().timeIntervalSince(trace.sentAt) * 1000)
+        print("[RelayService][Trace] first-event transport=\(trace.transport) session=\(sessionId ?? "none") event=\(event) latencyMs=\(latencyMs) preview=\"\(trace.preview)\"")
+    }
+
+    private func summarizeTraceText(_ text: String, maxLength: Int = 80) -> String {
+        let compact = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !compact.isEmpty else { return "" }
+        if compact.count <= maxLength {
+            return compact
+        }
+        let endIndex = compact.index(compact.startIndex, offsetBy: maxLength)
+        return String(compact[..<endIndex]) + "..."
+    }
+
     // MARK: - Event handlers
 
     private func handlePtyOutput(_ data: String) {
@@ -367,6 +442,10 @@ final class RelayService: ObservableObject {
               let text = json["text"] as? String else { return }
         let sessionId = json["sessionId"] as? String
         let isBootstrap = json["bootstrap"] as? Bool ?? false
+
+        if !isBootstrap {
+            logFirstResponseIfNeeded(sessionId: sessionId, event: "pty-output")
+        }
 
         let cleaned = sanitizeTerminalText(text)
         guard shouldDisplayPtyOutput(cleaned, sessionId: sessionId, isBootstrap: isBootstrap) else { return }
@@ -544,6 +623,18 @@ final class RelayService: ObservableObject {
         clearPendingApproval(for: approval)
     }
 
+    private func showSessionUnavailableMessage(for sessionId: String?) {
+        let line = TerminalLine(
+            text: "This session has exited on your Mac and can no longer receive messages.",
+            type: .error,
+            sessionId: sessionId
+        )
+        terminalBuffer.append(line)
+        appendToSession(line, sessionId: sessionId)
+        recentTerminalLines = terminalBuffer.getLast(15)
+        isThinking = false
+    }
+
     // MARK: - Send command
 
     /// Sends a text command to the bridge (iOS equivalent of watchOS voice input).
@@ -552,6 +643,16 @@ final class RelayService: ObservableObject {
         guard !trimmedText.isEmpty else { return }
 
         let requestedSession = sessionId.flatMap { session(for: $0) }
+        if let sessionId, requestedSession == nil {
+            showSessionUnavailableMessage(for: sessionId)
+            Task { await refreshSessionsFromBridgeStatus() }
+            return
+        }
+        if let requestedSession, requestedSession.activity == .ended {
+            showSessionUnavailableMessage(for: requestedSession.id)
+            Task { await refreshSessionsFromBridgeStatus() }
+            return
+        }
         let fallbackSession = requestedSession.flatMap { preferredWritableSession(for: $0) }
         let sid = requestedSession?.writable == true
             ? requestedSession?.id
@@ -569,6 +670,7 @@ final class RelayService: ObservableObject {
         recentTerminalLines = terminalBuffer.getLast(15)
 
         isThinking = true
+        recordPendingCommandTrace(sessionId: sid, text: trimmedText)
 
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
@@ -584,6 +686,7 @@ final class RelayService: ObservableObject {
                     await MainActor.run {
                         if let spawnedSessionId {
                             self.focusedSessionId = spawnedSessionId
+                            self.movePendingCommandTrace(from: sid, to: spawnedSessionId)
                             let line = TerminalLine(
                                 text: "Opened a writable \(requestedSession.agent.rawValue) session for voice input.",
                                 type: .system,
@@ -600,9 +703,16 @@ final class RelayService: ObservableObject {
 
                 try await bridgeClient.sendCommand(text: trimmedText + "\n", sessionId: sid)
             } catch BridgeClient.BridgeError.unauthorized {
+                await MainActor.run { self.clearPendingCommandTrace(sessionId: sid) }
                 await MainActor.run { self.handleBridgeAuthRejected() }
             } catch let BridgeClient.BridgeError.serverError(message) {
                 await MainActor.run {
+                    self.clearPendingCommandTrace(sessionId: sid)
+                    if message.localizedCaseInsensitiveContains("has exited on your Mac") {
+                        self.showSessionUnavailableMessage(for: sid)
+                        Task { await self.refreshSessionsFromBridgeStatus() }
+                        return
+                    }
                     let line = TerminalLine(text: message, type: .error, sessionId: sid)
                     self.terminalBuffer.append(line)
                     self.appendToSession(line, sessionId: sid)
@@ -611,6 +721,7 @@ final class RelayService: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
+                    self.clearPendingCommandTrace(sessionId: sid)
                     let line = TerminalLine(text: error.localizedDescription, type: .error, sessionId: sid)
                     self.terminalBuffer.append(line)
                     self.appendToSession(line, sessionId: sid)
@@ -1008,9 +1119,12 @@ final class RelayService: ObservableObject {
     private func handlePollStatus(_ data: String) {
         guard let json = parseJSON(data) else { return }
 
+        let bridgeState = json["state"] as? String ?? "unknown"
+        let sessionCount = (json["sessions"] as? [[String: Any]])?.count ?? 0
+        print("[RelayService][Trace] poll-status state=\(bridgeState) sessions=\(sessionCount)")
+
         connectionState = .connected
-        if let bridgeState = json["state"] as? String,
-           bridgeState == "connected" || bridgeState == "idle" {
+        if bridgeState == "connected" || bridgeState == "idle" {
             lastConnected = Date()
         }
 
@@ -1059,6 +1173,10 @@ final class RelayService: ObservableObject {
         let phase = json["phase"] as? String
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        if role == "assistant" {
+            logFirstResponseIfNeeded(sessionId: sessionId, event: "conversation-message")
+        }
 
         let line: TerminalLine
         switch role {
@@ -1433,6 +1551,33 @@ final class RelayService: ObservableObject {
         }
     }
 
+    private func activeApprovalForMergedSession(
+        incoming: AgentSession,
+        existing: AgentSession?
+    ) -> ApprovalRequest? {
+        if let incomingApproval = incoming.pendingApproval {
+            return incomingApproval
+        }
+
+        guard let approval = pendingApproval else { return nil }
+
+        let matchesSessionId: (String?) -> Bool = { sessionId in
+            guard let sessionId else { return false }
+            return incoming.id == sessionId || incoming.externalSessionId == sessionId
+        }
+
+        if matchesSessionId(pendingApprovalSessionId) || matchesSessionId(approval.sessionId) {
+            return approval
+        }
+
+        if let permissionId = approval.permissionId,
+           existing?.pendingApproval?.permissionId == permissionId {
+            return approval
+        }
+
+        return nil
+    }
+
     private func mergeSessionsSnapshot(_ snapshot: [AgentSession], requestedSessionId: String? = nil) {
         let previousFocused = focusedSessionId
         var syncedSessions: [AgentSession] = []
@@ -1444,9 +1589,10 @@ final class RelayService: ObservableObject {
                 tmuxSessionName: incoming.tmuxSessionName
             )
             let existing = existingIndex.flatMap { sessions.indices.contains($0) ? sessions[$0] : nil }
+            let activeApproval = activeApprovalForMergedSession(incoming: incoming, existing: existing)
 
             let activity: SessionActivity = {
-                if existing?.pendingApproval != nil || existing?.activity == .waitingApproval {
+                if activeApproval != nil {
                     return .waitingApproval
                 }
                 return incoming.activity
@@ -1469,7 +1615,7 @@ final class RelayService: ObservableObject {
                 existing: existing?.terminalLines ?? [],
                 incoming: incoming.terminalLines
             )
-            merged.pendingApproval = existing?.pendingApproval
+            merged.pendingApproval = activeApproval
             merged.lastVisualActivityAt = existing?.lastVisualActivityAt
             syncedSessions.append(merged)
         }
